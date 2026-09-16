@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.4.2
+// @version      1.4.3
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -136,7 +136,8 @@
       this.d.cfg = Object.assign({
         // GitHub 私有仓库。凭据只存本机，snapshot() 是白名单式的，永不上传
         token: '', repo: '', repoPath: 'fw-marks.json', repoBranch: '',
-        davUrl: 'https://dav.jianguoyun.com/dav/fw-marks.json',  // 坚果云 WebDAV
+        // 必须带上文件夹那一层：坚果云不让直接写在 /dav/ 根目录
+        davUrl: 'https://dav.jianguoyun.com/dav/我的坚果云/fw-marks.json',
         davUser: '', davPass: '',
         autoSync: true,
       }, this.d.cfg || {});
@@ -349,23 +350,48 @@
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache',
       }),
+      /*
+       * 地址必须指到「某个同步文件夹里面」。
+       * 坚果云的 WebDAV 根目录（/dav/ 下面那一层）只是同步文件夹的列表，
+       * 直接往根上建文件是不允许的 —— 会回 403/409，而且报错文字看不出所以然。
+       * 所以这里先自己检查一遍路径层级，把话说明白。
+       */
+      rootPath() {
+        try {
+          const p = new URL(DB.d.cfg.davUrl).pathname.replace(/^\/+|\/+$/g, '');
+          // 正常是 dav/文件夹/文件名 → 至少 3 段；dav/文件名 只有 2 段
+          return p.split('/').filter(Boolean).length < 3;
+        } catch (e) { return false; }
+      },
+      err(status) {
+        if (status === 401) return '账号或应用密码不对（要用「应用密码」，不是登录密码）';
+        if (status === 403) return this.rootPath()
+          ? '坚果云不让直接写在根目录，地址要改成 …/dav/某个文件夹/fw-marks.json'
+          : '没有写权限（应用密码被吊销了？）';
+        if (status === 404) return '路径不存在';
+        if (status === 409) return '上级文件夹在坚果云里不存在，先去建好';
+        if (status === 507) return '坚果云空间满了';
+        return 'HTTP ' + status;
+      },
       async pull() {
+        if (this.rootPath()) {
+          throw new Error('地址指到了根目录。改成 …/dav/某个文件夹/fw-marks.json');
+        }
         const r = await GMx.req(DB.d.cfg.davUrl, { headers: this.hdr() });
         if (r.status === 404) return null; // 文件还不存在，第一次用
-        if (r.status === 401) throw new Error('账号或应用密码不对');
-        if (r.status >= 300) throw new Error('HTTP ' + r.status);
+        if (r.status >= 300) throw new Error(this.err(r.status));
         if (!r.text || !r.text.trim()) return null;
         try { return JSON.parse(r.text); }
         catch (e) { throw new Error('云端文件不是合法 JSON（被别的东西覆盖了？）'); }
       },
       async push(snap) {
+        if (this.rootPath()) {
+          throw new Error('地址指到了根目录。改成 …/dav/某个文件夹/fw-marks.json');
+        }
         const r = await GMx.req(DB.d.cfg.davUrl, {
           method: 'PUT', headers: this.hdr(), body: JSON.stringify(snap),
         });
-        if (r.status === 401) throw new Error('账号或应用密码不对');
-        if (r.status === 409) throw new Error('路径的上级文件夹不存在，去坚果云里先建好');
-        if (r.status === 507) throw new Error('坚果云空间满了');
-        if (r.status >= 300) throw new Error('HTTP ' + r.status);
+        if (r.status >= 300) throw new Error(this.err(r.status));
       },
     },
   };
@@ -518,16 +544,25 @@
         if (only && pid !== only) continue;
 
         let titleEl = el.querySelector(this.SEL.chapTitle);          // 排版 A
-        if (!titleEl && only) {                                      // 排版 B
+        let title = '';
+        if (titleEl) {
+          // 排版 A 的标题区只有章节号（比如「2」），章节名不在这里
+          title = (titleEl.textContent || '').replace(/\s+/g, ' ').trim();
+        } else if (only) {
+          // 排版 B：h3 是章节号、h5 是章节名 —— 两个都要，拼起来才认得出是哪章
+          const hs = [...el.querySelectorAll('.text-center strong')]
+            .map((x) => (x.textContent || '').replace(/\s+/g, ' ').trim())
+            .filter((x) => x && x !== '.');
           titleEl = el.querySelector('.text-center strong.h5') ||
                     el.querySelector('.text-center strong');
+          title = [...new Set(hs)].join(' ');
         }
         if (!titleEl) continue;
 
         out.push({
           pid,
           el,
-          title: (titleEl.textContent || '').replace(/\s+/g, ' ').trim(),
+          title,
           titleEl,
           body: el.querySelector(this.bodyOf(pid)) || el.querySelector('.main-text'),
         });
@@ -762,9 +797,15 @@
         }
       }
     }
+    // 章节名优先用「更全的那个」：正文页标题区只有章节号，
+    // 而逛目录时学下来的名字带章节名，那个才认得出是哪一章
+    const onPage = ch ? ch.title : Page.title;
+    const stored = (DB.chap(Page.bid, pid, false) || {}).title;
+    const title = (stored || '').length > (onPage || '').length ? stored : onPage;
+
     return {
       bid: Page.bid, cid: pid,
-      title: ch ? ch.title : Page.title,
+      title,
       url: chapUrl(pid),
       pct, cpct, anchor, ts: now(),
     };
@@ -1347,9 +1388,11 @@
         <input type="text" data-davuser placeholder="账号（坚果云注册邮箱）" value="${esc(c.davUser)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
         <input type="password" data-davpass placeholder="应用密码（不是登录密码！）" value="${esc(c.davPass)}" style="margin-top:7px">
         <div class="hint">
-          坚果云 → 账户信息 → <b>安全选项</b> → 添加应用 → 生成的那串就是应用密码喵。<br>
-          地址默认写到你坚果云根目录的 <code>fw-marks.json</code>；想放进某个文件夹就改成
-          <code>…/dav/文件夹名/fw-marks.json</code>，<b>文件夹要先在坚果云里建好</b>。
+          坚果云 → 账户信息 → <b>安全选项</b> → 添加应用 → 生成的那串就是应用密码喵<br>
+          （<b>不是登录密码</b>）。<br>
+          地址<b>必须带上文件夹那一层</b>：<code>…/dav/文件夹名/fw-marks.json</code>。<br>
+          坚果云的 <code>/dav/</code> 根目录只是同步文件夹的列表，直接往根上写会被拒；
+          <b>文件夹要先在坚果云里存在</b>（默认就有「我的坚果云」）。
         </div>
       </div>
 
@@ -1627,11 +1670,49 @@
       }
       const cid = Page.native ? FW.pidOfLink(a) : Page.idsFrom(a.href).cid;
       if (!cid) continue;
+      learnChapName(cid, catalogNameOf(a, row));
       attachBadge(a, chapBadgeHTML(
         DB.chap(Page.bid, cid, false),
         !!(prog && prog.cid === cid),
         DB.bmksOfChap(Page.bid, cid).length));
     }
+  }
+
+  /*
+   * 目录才是章节名的权威来源。
+   * 正文页的标题区只有章节号（「2」），章节名根本不在那儿；
+   * 所以逛目录的时候顺手把完整名字学下来，回填给进度和书签，
+   * 这样「上次读到」显示的就不是一个光秃秃的数字了。
+   *
+   * 桌面版目录是表格：第 1 格章节号、第 2 格章节名，两个都要。
+   * 手机版目录是一排按钮，按钮上写什么就取什么。
+   */
+  function catalogNameOf(a, row) {
+    if (row) {
+      const cells = [...row.querySelectorAll('th,td')].slice(0, 2)
+        .map((c) => (c.textContent || '').replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+      if (cells.length) return [...new Set(cells)].join(' ');
+    }
+    return (a.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  // 只在「学到的名字更全」时才回填，避免把好名字覆盖成光数字，
+  // 也避免每次逛目录都 touch 一遍、白白造同步流量
+  function learnChapName(cid, name) {
+    if (!name || !Page.bid) return;
+    const richer = (a, b) => (a || '').length > (b || '').length;
+
+    const c = DB.chap(Page.bid, cid, false);
+    if (c && !c.deleted && richer(name, c.title)) { c.title = name; DB.touch(c); }
+
+    const b = DB.book(Page.bid, false);
+    if (b && b.progress && b.progress.cid === cid && richer(name, b.progress.title)) {
+      b.progress.title = name; DB.touch(b);
+    }
+    DB.bmksOf(Page.bid).forEach((m) => {
+      if (m.cid === cid && richer(name, m.title)) { m.title = name; DB.touch(m); }
+    });
   }
 
   // ---- 书籍介绍页：书名后挂标签 + 目录上方一条「上次读到哪」 ----
