@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.4.1
+// @version      1.4.2
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -35,6 +35,18 @@
 (async function () {
   'use strict';
   if (window.top !== window.self) return;
+
+  /*
+   * 防重复注入。
+   * 装两份是很容易发生的：本地文件放了一份，又用 Userscripts 的
+   * 「New Remote」按链接加了一份 —— 两边都会跑，结果顶栏两个入口、
+   * 每章两条标记条、事件监听全翻倍。
+   * 标记打在 documentElement 上（而不是 window 变量）：注入上下文可能是
+   * 隔离世界，window 彼此看不见，但 DOM 是共享的；而且这一步是同步的，
+   * 不会出现「两份都还没建好就都通过检查」的竞态。
+   */
+  if (document.documentElement.dataset.fwMarksLoaded) return;
+  document.documentElement.dataset.fwMarksLoaded = '1';
 
   const MARKS = {
     good: { label: '精彩', color: '#e8554e' },
