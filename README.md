@@ -18,7 +18,7 @@ iOS Safari 用户脚本。不需要 Xcode，不需要签名，不会过期。
 ### 方式 A：自动测试台（不用连网、不碰真站）
 
 ```bash
-cd fw-userscript
+cd fw-marks
 python3 test/run-test.py
 ```
 
