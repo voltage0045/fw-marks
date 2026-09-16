@@ -106,9 +106,34 @@ Mac App Store 搜 **Userscripts** —— 和 iOS 是同一个 App，GM 存储、
 @downloadURL  https://raw.githubusercontent.com/voltage0045/fw-marks/main/fw-marks.user.js
 ```
 
-**但别指望它后台自己更新** —— Userscripts 有个 release 说明提到
-**自动更新检查曾被暂时禁用**，实测（v4.8.6）放了远端新版本也不会自己拉。
-所以要么从扩展弹窗里手动触发检查，要么走下面的兜底办法。
+扩展**会定期检查** save location 里所有脚本有没有新版，但**查到之后不会悄悄替你换掉** ——
+要自己去弹窗里的 **Available Updates view**（☁️⬇ 那个图标）点应用。
+所以「推了新版但设备上版本号没变」是正常的，不是坏了，去那个 view 里看一眼就行。
+
+### iOS 上怎么按链接装 / 更新
+
+iOS 版**没有内置编辑器**，弹窗里也**没有**「填链接」的入口。正确流程是：
+
+1. **Safari 里直接打开 `.user.js` 链接**：
+   <https://raw.githubusercontent.com/voltage0045/fw-marks/main/fw-marks.user.js>
+2. 然后**打开 Userscripts 扩展弹窗** → 会冒出安装提示 → 装进 save location
+
+> URL 的**路径**必须以 `.user.js` 结尾（不能藏在 `?query` 或 `#hash` 里），否则不认。
+
+装好之后，以后更新就只用点 ☁️⬇ 那个 view 里的条目，**再也不用传文件**了喵。
+
+iOS 弹窗那排图标的含义：
+
+| 图标 | 作用 |
+|---|---|
+| 📁 | All scripts view —— save location 里的全部脚本 |
+| ☁️⬇ | **Available Updates view —— 更新就在这里应用** |
+| 🔄 | 刷新弹窗显示 |
+| 开关 | 注入总开关 |
+
+### macOS 上按链接装
+
+弹窗里 `+` → **New Remote** → 粘 `.user.js` 链接。
 
 发新版时两个文件**必须一起传**（`.meta.js` 是给扩展比版本号用的，
 只传 `.user.js` 它不知道有新版）：
