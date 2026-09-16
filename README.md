@@ -96,6 +96,56 @@ Mac App Store 搜 **Userscripts** —— 和 iOS 是同一个 App，GM 存储、
 
 ---
 
+## 一·五、更新脚本
+
+脚本头里已经配好了远程更新地址：
+
+```
+@version      当前版本号
+@updateURL    https://raw.githubusercontent.com/voltage0045/fw-marks/main/fw-marks.meta.js
+@downloadURL  https://raw.githubusercontent.com/voltage0045/fw-marks/main/fw-marks.user.js
+```
+
+**但别指望它后台自己更新** —— Userscripts 有个 release 说明提到
+**自动更新检查曾被暂时禁用**，实测（v4.8.6）放了远端新版本也不会自己拉。
+所以要么从扩展弹窗里手动触发检查，要么走下面的兜底办法。
+
+发新版时两个文件**必须一起传**（`.meta.js` 是给扩展比版本号用的，
+只传 `.user.js` 它不知道有新版）：
+
+```bash
+cd ~/fw-marks
+# 改完代码后：升 @version → 重新生成 meta → 提交推送
+python3 -c "import re;s=open('fw-marks.user.js',encoding='utf-8').read();\
+open('fw-marks.meta.js','w',encoding='utf-8').write(\
+re.search(r'// ==UserScript==.*?// ==/UserScript==',s,re.S).group(0)+'\n')"
+git add -A && git commit -m "vX.Y.Z" && git push
+```
+
+### 兜底：直接覆盖文件（最可靠）
+
+**Mac**：
+```bash
+cp ~/fw-marks/fw-marks.user.js \
+  ~/Library/Containers/com.userscripts.macos.Userscripts-Extension/Data/Documents/scripts/
+```
+
+**iPhone**：起个局域网取件服务，手机 Safari 下载后移到 Userscripts 目录。
+（公司 Wi-Fi 常开客户端隔离 → 用 iPhone 开热点、Mac 连上去，就绕过了）
+
+### 怎么看装的是哪个版本
+
+```bash
+grep -m1 "@version" \
+  ~/Library/Containers/com.userscripts.macos.Userscripts-Extension/Data/Documents/scripts/fw-marks.user.js
+```
+或者：Safari 点 Userscripts 扩展图标 → 点那条脚本 → 编辑器里第 4 行。
+
+> 外部编辑器改完脚本后，**必须先点开扩展弹窗并等它加载完**，注入才会生效 ——
+> 这是 Userscripts 的已知行为。
+
+---
+
 ## 二、配置云同步（双备份）
 
 顶栏 **📑 我的标记** → `⚙️ 同步设置`。两个都填上才是双备份，只填一个也能用。
