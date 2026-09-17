@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.5.1
+// @version      1.5.2
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1747,6 +1747,39 @@
   //    全部走内联样式，不受网站 CSS 影响；节点带 data-fw-* 便于原地更新
   // ==========================================================================
 
+  /*
+   * 重绘用的索引。
+   * 原来每个章节链接都要 bmksOf() 全表扫一遍书签再排序 —— 一本 138 章的书，
+   * 一轮重绘就是两百多次全表扫描，手机上白烧电。
+   * 现在一轮只建一次索引，查的时候 O(1)。
+   * paintAll() 开头置空，用的时候懒构建，所以永远不会读到过期的。
+   */
+  let IDX = null;
+  function idx() {
+    if (IDX) return IDX;
+    const byChap = new Map();   // '书|章' → [书签…]
+    const byBook = new Map();   // 书 → [书签…]
+    const marked = new Map();   // 书 → 标记过的章数
+    for (const m of Object.values(DB.d.bmks)) {
+      if (!m || m.deleted || !m.bid) continue;
+      const k = m.bid + '|' + m.cid;
+      if (!byChap.has(k)) byChap.set(k, []);
+      if (!byBook.has(m.bid)) byBook.set(m.bid, []);
+      byChap.get(k).push(m);
+      byBook.get(m.bid).push(m);
+    }
+    for (const c of Object.values(DB.d.chaps)) {
+      if (!c || c.deleted || !(c.mark || c.note)) continue;
+      marked.set(c.bid, (marked.get(c.bid) || 0) + 1);
+    }
+    IDX = {
+      bmksOfChap: (bid, cid) => byChap.get(bid + '|' + cid) || [],
+      bmksOfBook: (bid) => byBook.get(bid) || [],
+      markedCount: (bid) => marked.get(bid) || 0,
+    };
+    return IDX;
+  }
+
   // 往 host 里塞/更新/移除一个角标。html 为空串就把角标撤掉
   function attachBadge(host, html, where) {
     if (!host) return;
@@ -1785,9 +1818,9 @@
     const prog = bp
       ? pill('#e8554e', '▶ ' + esc((bp.title || '').slice(0, 14) || '读过'))
       : '';
-    const n = DB.chapsOf(b.id).filter((c) => c.mark || c.note).length;
+    const n = idx().markedCount(b.id);
     const cnt = n ? `<span style="color:#999;margin-left:4px">${n}章</span>` : '';
-    const nb = DB.bmksOf(b.id).length;
+    const nb = idx().bmksOfBook(b.id).length;
     const bm = nb ? `<span style="color:#d98b00;margin-left:4px" title="${nb} 个书签">🔖${nb}</span>` : '';
     const rev = b.review ? '<span style="margin-left:3px" title="有总评">📝</span>' : '';
     return tags + prog + cnt + bm + rev;
@@ -1819,7 +1852,7 @@
       attachBadge(a, chapBadgeHTML(
         DB.chap(Page.bid, cid, false),
         !!(prog && prog.cid === cid),
-        DB.bmksOfChap(Page.bid, cid).length));
+        idx().bmksOfChap(Page.bid, cid).length));
     }
   }
 
@@ -1853,8 +1886,8 @@
 
     const pg = DB.prog(Page.bid);
     if (pg && pg.cid === cid && richer(name, pg.title)) { pg.title = name; DB.touch(pg); }
-    DB.bmksOf(Page.bid).forEach((m) => {
-      if (m.cid === cid && richer(name, m.title)) { m.title = name; DB.touch(m); }
+    idx().bmksOfChap(Page.bid, cid).forEach((m) => {
+      if (richer(name, m.title)) { m.title = name; DB.touch(m); }
     });
   }
 
@@ -1948,7 +1981,7 @@
       const note = live ? c.note : '';
       const btn = (extra, attrs, txt) =>
         `<span ${attrs} style="display:inline-block;margin:0 3px;padding:2px 11px;border-radius:11px;cursor:pointer;${extra}">${txt}</span>`;
-      const nb = DB.bmksOfChap(Page.bid, ch.pid).length;
+      const nb = idx().bmksOfChap(Page.bid, ch.pid).length;
       const html =
         Object.entries(MARKS).map(([k, m]) =>
           btn(cur === k ? `background:${m.color};color:#fff;font-weight:700` : 'background:#8881;color:#999',
@@ -2008,8 +2041,8 @@
     }
 
     const b = DB.book(Page.bid, false);
-    const nb = DB.bmksOf(Page.bid).length;
-    const nc = DB.chapsOf(Page.bid).filter((c) => c.mark || c.note).length;
+    const nb = idx().bmksOfBook(Page.bid).length;
+    const nc = idx().markedCount(Page.bid);
     const btn = (v, txt) =>
       `<span data-fw-open="${v}" style="display:inline-block;margin:0 4px;padding:3px 12px;` +
       `border-radius:12px;cursor:pointer;background:#8881;color:#666">${txt}</span>`;
@@ -2021,6 +2054,7 @@
   }
 
   function paintAll() {
+    IDX = null;                       // 这一轮重新建索引，免得读到过期数据
     injectNavEntry(); injectPageActions();
     paintCatalog(); paintProfile(); paintBookList(); paintInline();
   }
