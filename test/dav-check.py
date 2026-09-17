@@ -24,9 +24,19 @@ import urllib.request
 DAV_ROOT = 'https://dav.jianguoyun.com/dav/'
 
 
+def enc(url):
+    """路径里的非 ASCII（比如中文文件夹名）要先 percent-encode，
+    否则 urllib 连请求都发不出去，看起来就像「连不上」。"""
+    p = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((
+        p.scheme, p.netloc,
+        urllib.parse.quote(p.path, safe='/'),
+        p.query, p.fragment))
+
+
 def req(method, url, user, pw, body=None, headers=None):
     """发一个请求，只回 (状态码, 正文)，不抛异常。"""
-    r = urllib.request.Request(url, data=body, method=method)
+    r = urllib.request.Request(enc(url), data=body, method=method)
     token = base64.b64encode(f'{user}:{pw}'.encode()).decode()
     r.add_header('Authorization', 'Basic ' + token)
     for k, v in (headers or {}).items():
@@ -109,8 +119,20 @@ def main():
     code, body = req('PUT', probe, user, pw, body=b'{"selftest":true}',
                      headers={'Content-Type': 'application/json'})
     print(f'  PUT  → {code} {explain(code)}')
-    if code >= 300 and body:
+    ex = re.search(r'<s:exception>(.*?)</s:exception>', body or '')
+    msg = re.search(r'<s:message>(.*?)</s:message>', body or '')
+    if ex:
+        print(f'  ⚠️ 服务器自报的原因：{ex.group(1)}'
+              + (f' —— {msg.group(1)}' if msg else ''))
+        if ex.group(1) == 'AccountExpired':
+            print('     → 坚果云账户已过期，去续期；或者先只用 GitHub 私有仓库那一路')
+    elif code >= 300 and body:
         print('  服务器说：', re.sub(r'\s+', ' ', body)[:200])
+    if code == 0:
+        print('\n× 请求根本没发出去（不是服务器拒绝）。检查网络/代理，'
+              '或者地址里有没有打错字。')
+        print('  详情：', body)
+        return 1
     if code < 300:
         dcode, _ = req('DELETE', probe, user, pw)
         print(f'  清理 DELETE → {dcode}')

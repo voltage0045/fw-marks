@@ -296,8 +296,12 @@ CHECK_JS = r"""
       var sr = h && h.shadowRoot;
       var sh = sr ? sr.querySelector('.sheet') : null;
       r.navOpens = !!(sh && sh.classList.contains('on'));
-      // 取书 id 而不是书名：书名会被页面上的真实标题覆盖（noteBook 会更新它），
-      // 拿 id 比才稳，也不用把站点内容写进断言
+      // 三个 subtab 都该存在
+      r.tabCount = sr ? sr.querySelectorAll('.tabs [data-tab]').length : 0;
+      // 排序验在「评价」tab：默认的「书签」tab 只有一本书有书签，看不出先后。
+      // 取书 id 而不是书名 —— 书名会被页面上的真实标题覆盖（noteBook 会更新它）
+      var rate = sr ? sr.querySelector('[data-tab="rate"]') : null;
+      if (rate) rate.click();
       r.allListOrder = sr
         ? [].map.call(sr.querySelectorAll('.book'),
             function (e) { return e.getAttribute('data-bid'); }).slice(0, 3)
@@ -602,6 +606,12 @@ def static_checks():
     # 同步哪些表由 COLLECTIONS 一处决定，所以直接盯住它别混进凭据
     m = re.search(r"const COLLECTIONS = \[(.*?)\]", s)
     coll = [x.strip().strip("'\"") for x in (m.group(1).split(',') if m else [])]
+    # 开关必须真的卡住 ready()，否则「关掉」只是界面上看着关了、照样在同步
+    checks.append(('云端开关真的控制 ready()',
+                   bool(re.search(r"ready: \(\) => !!\(DB\.d\.cfg\.repoOn", s)) and
+                   bool(re.search(r"ready: \(\) => !!\(DB\.d\.cfg\.davOn", s))))
+    checks.append(('设置里两段都有开关',
+                   s.count('data-backon=') >= 2))
     checks.append(('同步的表清单是白名单，且不含 cfg',
                    bool(coll) and 'cfg' not in coll and
                    set(coll) == {'books', 'chaps', 'bmks', 'prog'}))
@@ -642,7 +652,10 @@ def main():
             ('目录上方有 3 个操作按钮', lambda r: r['pageActions'] == 3),
             ('顶栏那一项写着「我的标记」', lambda r: '我的标记' in r['navText']),
             ('点顶栏入口能打开面板',   lambda r: r['navOpens'] is True),
+            ('我的标记有三个 subtab',  lambda r: r.get('tabCount') == 3),
             ('最近读的书排在列表最前', lambda r: (r.get('allListOrder') or [None])[0] == TID),
+            ('评价 tab 列出了多本书（排序才有意义）',
+             lambda r: len(r.get('allListOrder') or []) >= 2),
             ('页面链接没被挡住',       lambda r: not r['blockedLinks']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),

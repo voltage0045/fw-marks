@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.5.2
+// @version      1.7.0
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -142,6 +142,7 @@
       this.d.site = this.d.site || {};
       this.d.cfg = Object.assign({
         // GitHub 私有仓库。凭据只存本机，snapshot() 是白名单式的，永不上传
+        repoOn: true, davOn: true,   // 各自的总开关，关掉就完全不用它
         token: '', repo: '', repoPath: 'fw-marks.json', repoBranch: '',
         // 必须带上文件夹那一层：坚果云不让直接写在 /dav/ 根目录
         davUrl: 'https://dav.jianguoyun.com/dav/我的坚果云/fw-marks.json',
@@ -414,7 +415,7 @@
      */
     repo: {
       label: 'GitHub 私有仓库',
-      ready: () => !!(DB.d.cfg.token && DB.d.cfg.repo),
+      ready: () => !!(DB.d.cfg.repoOn && DB.d.cfg.token && DB.d.cfg.repo),
       _sha: null,          // 上次见到的文件版本号，PUT 更新时必须带上
       hdr: () => ({
         Authorization: 'Bearer ' + DB.d.cfg.token,
@@ -433,17 +434,21 @@
           branch: br,
         };
       },
-      err(status) {
-        if (status === 401) return 'Token 无效或已过期';
-        if (status === 403) return 'Token 没有这个仓库的 Contents 权限';
-        if (status === 404) return '仓库或路径不对（owner/仓库名 写对了吗？）';
-        return 'HTTP ' + status;
+      err(status, body) {
+        // GitHub 会在 JSON 里写清楚原因，带上比只给状态码有用
+        let why = '';
+        try { why = (JSON.parse(body || '{}').message || ''); } catch (e) {}
+        const base = status === 401 ? 'Token 无效或已过期'
+          : status === 403 ? 'Token 没有这个仓库的 Contents 权限'
+          : status === 404 ? '仓库或路径不对（owner/仓库名 写对了吗？）'
+          : 'HTTP ' + status;
+        return why ? base + '（' + why + '）' : base;
       },
       async pull() {
         const { base, ref } = this.api();
         const r = await GMx.req(base + ref, { headers: this.hdr() });
         if (r.status === 404) { this._sha = null; return null; } // 文件还没建，第一次用
-        if (r.status >= 300) throw new Error(this.err(r.status));
+        if (r.status >= 300) throw new Error(this.err(r.status, r.text));
         const j = JSON.parse(r.text);
         this._sha = j.sha || null;
         if (!j.content) return null;
@@ -466,7 +471,7 @@
           await this.pull();
           r = await GMx.req(base, { method: 'PUT', headers: this.hdr(), body: body() });
         }
-        if (r.status >= 300) throw new Error(this.err(r.status));
+        if (r.status >= 300) throw new Error(this.err(r.status, r.text));
         const j = JSON.parse(r.text || '{}');
         if (j.content && j.content.sha) this._sha = j.content.sha; // 记住新 sha，下次省一次 GET
       },
@@ -474,7 +479,7 @@
 
     dav: {
       label: '坚果云',
-      ready: () => !!(DB.d.cfg.davUrl && DB.d.cfg.davUser && DB.d.cfg.davPass),
+      ready: () => !!(DB.d.cfg.davOn && DB.d.cfg.davUrl && DB.d.cfg.davUser && DB.d.cfg.davPass),
       hdr: () => ({
         Authorization: 'Basic ' + b64(DB.d.cfg.davUser + ':' + DB.d.cfg.davPass),
         'Content-Type': 'application/json; charset=utf-8',
@@ -495,11 +500,26 @@
           return p.split('/').filter(Boolean).length < 3;
         } catch (e) { return false; }
       },
-      err(status) {
+      /*
+       * 坚果云出错时会在正文里自报原因（<s:exception>），比 HTTP 状态码
+       * 有用得多 —— 比如 AccountExpired 一眼就知道是账户过期，
+       * 而状态码只是个 403，会让人以为是权限配错了。优先用它。
+       */
+      err(status, body) {
+        const ex = (/<s:exception>(.*?)<\/s:exception>/.exec(body || '') || [])[1];
+        const known = {
+          AccountExpired: '坚果云账户已过期 —— 去坚果云续期；或者先只用 GitHub 那一路',
+          NoPermission: '这个文件夹没有写权限（是别人共享给你的只读文件夹？）',
+          OverQuota: '坚果云空间或流量用完了',
+          InvalidAuth: '账号或应用密码不对（要用「应用密码」，不是登录密码）',
+        }[ex];
+        if (known) return known;
+        if (ex) return ex;   // 没见过的异常名，原样报出来总比只给状态码强
+
         if (status === 401) return '账号或应用密码不对（要用「应用密码」，不是登录密码）';
         if (status === 403) return this.rootPath()
           ? '坚果云不让直接写在根目录，地址要改成 …/dav/某个文件夹/fw-marks.json'
-          : '没有写权限（应用密码被吊销了？）';
+          : '没有写权限';
         if (status === 404) return '路径不存在';
         if (status === 409) return '上级文件夹在坚果云里不存在，先去建好';
         if (status === 507) return '坚果云空间满了';
@@ -511,7 +531,7 @@
         }
         const r = await GMx.req(DB.d.cfg.davUrl, { headers: this.hdr() });
         if (r.status === 404) return null; // 文件还不存在，第一次用
-        if (r.status >= 300) throw new Error(this.err(r.status));
+        if (r.status >= 300) throw new Error(this.err(r.status, r.text));
         if (!r.text || !r.text.trim()) return null;
         try { return JSON.parse(r.text); }
         catch (e) { throw new Error('云端文件不是合法 JSON（被别的东西覆盖了？）'); }
@@ -523,7 +543,7 @@
         const r = await GMx.req(DB.d.cfg.davUrl, {
           method: 'PUT', headers: this.hdr(), body: JSON.stringify(snap),
         });
-        if (r.status >= 300) throw new Error(this.err(r.status));
+        if (r.status >= 300) throw new Error(this.err(r.status, r.text));
       },
     },
   };
@@ -898,7 +918,7 @@
   Page.detect();
 
   // 章节固定链接。正文页的 URL 指的是整个 thread（还带 ?page=），
-  // 存进数据里的必须是 /posts/{pid}，否则「全部书签」点过去会跳错地方
+  // 存进数据里的必须是 /posts/{pid}，否则「我的标记」点过去会跳错地方
   const chapUrl = (cid) =>
     (Page.native && cid ? location.origin + '/posts/' + cid : location.href);
 
@@ -1203,6 +1223,17 @@
   }
   .chaplist .n { color: #8e8e93; font-size: 11.5px; display: block; }
 
+  .sw { float: right; font-size: 11px; font-weight: 600; padding: 2px 10px;
+    border-radius: 10px; background: #e5e5ea; color: #8e8e93; cursor: pointer; }
+  .sw.on { background: #34a853; color: #fff; }
+
+  .tabs { display: flex; gap: 6px; margin-bottom: 13px; }
+  .tabs button {
+    flex: 1; padding: 8px 0; border: none; border-radius: 9px;
+    background: #f0f0f2; color: #6b6b70; font-size: 13px;
+  }
+  .tabs button.on { background: #e8554e; color: #fff; font-weight: 600; }
+
   .bmklist { margin-top: 8px; border-top: 1px dashed #e5e5e7; padding-top: 7px; display: none; }
   .bmklist.on { display: block; }
   .bmk { display: flex; align-items: flex-start; gap: 6px;
@@ -1317,7 +1348,7 @@
   function navBtns(extra = '') {
     return `<div class="btns" style="margin-top:18px">
       ${extra}
-      <button class="btn g" data-go="all">📚 全部书签</button>
+      <button class="btn g" data-go="all">📚 我的标记</button>
       <button class="btn g" data-go="cfg">⚙️ 同步设置</button>
     </div>`;
   }
@@ -1330,7 +1361,7 @@
       去这本书的<b>目录页</b>，从「⚙️ 同步设置」里点<b>重新校准</b>，<br>再点一下任意章节链接就能教会本喵。</div>${navBtns()}`;
   }
 
-  // ---- 书签列表（章节面板 / 书籍面板 / 全部书签 三处共用）----
+  // ---- 书签列表（章节面板 / 书籍面板 / 我的标记 三处共用）----
   // 书签就是个纯位置，不起名字：章节名 + 百分比 + 那句原文，足够认出是哪儿了
   function bmkListHTML(list, emptyHint, showChap) {
     if (!list.length) return emptyHint ? `<div class="hint">${esc(emptyHint)}</div>` : '';
@@ -1422,11 +1453,25 @@
   // ---- 管理面板：所有书 + 搜索 ----
   // 搜索时只重绘列表、不动输入框 —— 否则 iOS 上每输一个字键盘都会闪一下
   let searchKw = '';
+  /*
+   * 「我的标记」拆成三个 subtab。
+   * 原来把书签、进度、评价全堆在每本书下面，找什么都得先翻书 ——
+   * 三件事的用法其实完全不同：书签是「回到某处」，进度是「接着读」，
+   * 评价是「这书怎么样」。分开之后各看各的。
+   * 搜索框在每个 tab 内部生效。
+   */
+  const ALL_TABS = [['bmk', '🔖 书签'], ['prog', '▶ 进度'], ['rate', '⭐ 评价']];
+  let allTab = 'bmk';
+
   function renderAll(kw) {
     if (kw !== undefined) searchKw = kw;
-    sTitle.textContent = '全部书签';
+    sTitle.textContent = '我的标记';
     sBody.innerHTML = `
-      <div class="row"><input type="text" data-search placeholder="搜书名 / 标签 / 章节 / 备注…"
+      <div class="tabs">
+        ${ALL_TABS.map(([k, label]) =>
+          `<button data-tab="${k}" class="${allTab === k ? 'on' : ''}">${label}</button>`).join('')}
+      </div>
+      <div class="row"><input type="text" data-search placeholder="搜书名 / 章节 / 备注 / 标签…"
         value="${esc(searchKw)}" autocapitalize="off" autocorrect="off"></div>
       <div data-list></div>
       ${navBtns()}
@@ -1434,60 +1479,189 @@
     paintList();
   }
 
+  const bookName = (b) => esc((b && b.title) || ('（未命名 · ' + (b ? b.id : '') + '）'));
+  // 最近有动静的排最前，三个 tab 一致
+  const booksByRecent = () =>
+    DB.liveBooks().sort((a, b) => DB.lastActive(b.id) - DB.lastActive(a.id));
+  const emptyBox = (kw, hint) =>
+    `<div class="empty">${kw ? '没搜到喵' : hint}</div>`;
+
   function paintList() {
-    const kw = searchKw;
-    // 按「最后有动静」排，最近读的排最前（进度是独立表，得一起算进来）
-    const books = DB.liveBooks().sort((a, b) => DB.lastActive(b.id) - DB.lastActive(a.id));
-    const hit = (b) => {
-      if (!kw) return true;
-      const k = kw.toLowerCase();
-      return (b.title || '').toLowerCase().includes(k) ||
-        (b.review || '').toLowerCase().includes(k) ||
-        b.tags.some((t) => t.toLowerCase().includes(k)) ||
-        DB.chapsOf(b.id).some((c) => (c.title || '').toLowerCase().includes(k) || (c.note || '').toLowerCase().includes(k)) ||
-        DB.bmksOf(b.id).some((m) => (m.title || '').toLowerCase().includes(k) ||
-          (m.anchor || '').toLowerCase().includes(k));
-    };
-    const list = books.filter(hit);
-    sSub.textContent = kw ? `${list.length} / ${books.length} 本` : `${books.length} 本`;
     const box = sBody.querySelector('[data-list]');
     if (!box) return;
-    box.innerHTML = `
-      ${list.length ? list.map((b) => {
-        const cs = DB.chapsOf(b.id).filter((c) => c.mark || c.note);
-        const bs = DB.bmksOf(b.id);
-        const bp = DB.prog(b.id);
-        const cnt = { good: 0, ok: 0, skip: 0 };
-        cs.forEach((c) => { if (c.mark) cnt[c.mark]++; });
-        return `<div class="book" data-bid="${esc(b.id)}">
-          <div class="bt">${esc(b.title || '（未命名 · ' + b.id + '）')}</div>
-          <div class="meta">
-            ${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) =>
-              `<span class="pill" style="background:${MARKS[k].color}">${MARKS[k].label} ${v}</span>`).join('')}
-            ${b.tags.length ? '<br>🏷 ' + b.tags.map(esc).join(' · ') : ''}
-            ${bp ? `<br>▶ 读到「${esc(bp.title || '')}」${Math.round((bp.cpct || bp.pct || 0) * 100)}%` : ''}
-            ${bs.length ? `<br>🔖 ${bs.length} 个书签` : ''}
-          </div>
-          ${b.review ? `<div class="rv">${esc(b.review)}</div>` : ''}
-          <div class="btns" style="margin-top:8px">
-            ${bp ? `<button class="btn sm" data-jump="${esc(bp.url)}">继续读</button>` : ''}
-            ${b.url ? `<button class="btn g sm" data-jump="${esc(b.url)}">去目录</button>` : ''}
-            ${cs.length ? `<button class="btn g sm" data-toggle>标记章节 ${cs.length}</button>` : ''}
-            ${bs.length ? `<button class="btn g sm" data-bmktoggle>🔖 书签 ${bs.length}</button>` : ''}
-            <button class="btn g sm" data-del="${esc(b.id)}">删除</button>
-          </div>
-          <div class="bmklist">${bmkListHTML(bs, '', true)}</div>
-          <div class="chaplist">
-            ${cs.sort((a, c) => (c.updatedAt || 0) - (a.updatedAt || 0)).map((c) => `
-              <a href="${esc(c.url)}">
-                ${c.mark ? `<span class="pill" style="background:${MARKS[c.mark].color}">${MARKS[c.mark].label}</span>` : ''}
-                ${esc(c.title || c.cid)}
-                ${c.note ? `<span class="n">📝 ${esc(c.note)}</span>` : ''}
-              </a>`).join('')}
-          </div>
-        </div>`;
-      }).join('') : `<div class="empty">${kw ? '没搜到喵' : '还没有任何标记喵～<br>去书里点几下吧'}</div>`}
-    `;
+    const kw = (searchKw || '').toLowerCase();
+    if (allTab === 'bmk') return paintBmkTab(box, kw);
+    if (allTab === 'prog') return paintProgTab(box, kw);
+    return paintRateTab(box, kw);
+  }
+
+  // ---- tab 1：书签 ----
+  function paintBmkTab(box, kw) {
+    const rows = [];
+    let total = 0;
+    for (const b of booksByRecent()) {
+      const bs = DB.bmksOf(b.id);
+      total += bs.length;
+      if (!bs.length) continue;
+      const nameHit = (b.title || '').toLowerCase().includes(kw);
+      const list = !kw || nameHit ? bs : bs.filter((m) =>
+        ((m.title || '') + (m.anchor || '')).toLowerCase().includes(kw));
+      if (!list.length) continue;
+      rows.push(`<div class="book" data-bid="${esc(b.id)}">
+        <div class="bt">${bookName(b)} <span class="n">🔖 ${list.length}</span></div>
+        ${bmkListHTML(list, '', true)}
+      </div>`);
+    }
+    sSub.textContent = total ? `共 ${total} 个书签` : '';
+    box.innerHTML = rows.length ? rows.join('')
+      : emptyBox(kw, '还没有书签喵～<br>读正文时点章节下面那个 🔖');
+  }
+
+  // ---- tab 2：阅读进度 ----
+  function paintProgTab(box, kw) {
+    const rows = [];
+    let total = 0;
+    for (const b of booksByRecent()) {
+      const p = DB.prog(b.id);
+      if (!p) continue;
+      total++;
+      if (kw && !((b.title || '') + (p.title || '')).toLowerCase().includes(kw)) continue;
+      rows.push(`<div class="book" data-bid="${esc(b.id)}">
+        <div class="bt">${bookName(b)}</div>
+        <div class="meta">▶ 读到「${esc(p.title || '某一章')}」 ${Math.round((p.cpct || p.pct || 0) * 100)}%</div>
+        <div class="btns" style="margin-top:8px">
+          <button class="btn sm" data-jump="${esc(p.url)}">继续读</button>
+          ${b.url ? `<button class="btn g sm" data-jump="${esc(b.url)}">去目录</button>` : ''}
+          <button class="btn g sm" data-progdel="${esc(b.id)}">清除进度</button>
+        </div>
+      </div>`);
+    }
+    sSub.textContent = total ? `${total} 本在读` : '';
+    box.innerHTML = rows.length ? rows.join('')
+      : emptyBox(kw, '还没有阅读进度喵～<br>读几章就会自动记下来');
+  }
+
+  // ---- tab 3：书本评价（书籍标签 / 总评 / 章节标记）----
+  function paintRateTab(box, kw) {
+    const rows = [];
+    let total = 0;
+    for (const b of booksByRecent()) {
+      const cs = DB.chapsOf(b.id).filter((c) => c.mark || c.note);
+      const has = cs.length || b.tags.length || b.review;
+      if (!has) continue;
+      total++;
+      const hit = !kw ||
+        (b.title || '').toLowerCase().includes(kw) ||
+        (b.review || '').toLowerCase().includes(kw) ||
+        b.tags.some((t) => t.toLowerCase().includes(kw)) ||
+        cs.some((c) => ((c.title || '') + (c.note || '')).toLowerCase().includes(kw));
+      if (!hit) continue;
+
+      const cnt = { good: 0, ok: 0, skip: 0 };
+      cs.forEach((c) => { if (c.mark) cnt[c.mark]++; });
+      rows.push(`<div class="book" data-bid="${esc(b.id)}">
+        <div class="bt">${bookName(b)}</div>
+        <div class="meta">
+          ${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) =>
+            `<span class="pill" style="background:${MARKS[k].color}">${MARKS[k].label} ${v}</span>`).join('')}
+          ${b.tags.length ? '<br>🏷 ' + b.tags.map(esc).join(' · ') : ''}
+        </div>
+        ${b.review ? `<div class="rv">${esc(b.review)}</div>` : ''}
+        <div class="btns" style="margin-top:8px">
+          ${b.url ? `<button class="btn g sm" data-jump="${esc(b.url)}">去目录</button>` : ''}
+          ${cs.length ? `<button class="btn g sm" data-toggle>标记章节 ${cs.length}</button>` : ''}
+          <button class="btn g sm" data-del="${esc(b.id)}">删除这本</button>
+        </div>
+        <div class="chaplist">
+          ${cs.sort((a, c) => (c.updatedAt || 0) - (a.updatedAt || 0)).map((c) => `
+            <a href="${esc(c.url)}">
+              ${c.mark ? `<span class="pill" style="background:${MARKS[c.mark].color}">${MARKS[c.mark].label}</span>` : ''}
+              ${esc(c.title || c.cid)}
+              ${c.note ? `<span class="n">📝 ${esc(c.note)}</span>` : ''}
+            </a>`).join('')}
+        </div>
+      </div>`);
+    }
+    sSub.textContent = total ? `${total} 本有评价` : '';
+    box.innerHTML = rows.length ? rows.join('')
+      : emptyBox(kw, '还没有评价喵～<br>读正文时点 精彩/一般/跳过，或写本书总评');
+  }
+
+  /*
+   * 一键自查。同步失败时只显示一行状态码，看不出到底哪儿不对；
+   * 这里把最容易出问题的几件事直接查给用户看，省得去翻文档或跑外部脚本：
+   *   · GitHub：仓库/路径/Token 到底能不能读
+   *   · 坚果云：列出账号下**真实存在**的同步文件夹（地址里文件夹名写错是头号原因），
+   *            并把服务器自报的原因（比如 AccountExpired）原样显示出来
+   */
+  async function runDiag() {
+    const box = sBody.querySelector('[data-diag]');
+    if (!box) return;
+    const line = (s) => `<div style="margin:3px 0">${s}</div>`;
+    box.innerHTML = `<div class="hint">检查中…</div>`;
+    const out = [];
+
+    // ---- GitHub 私有仓库 ----
+    if (Backends.repo.ready()) {
+      try {
+        const { base, ref } = Backends.repo.api();
+        const r = await GMx.req(base + ref, { headers: Backends.repo.hdr() });
+        out.push(r.status === 404
+          ? line('✅ GitHub：仓库能访问，数据文件还没建（首次同步会自动创建）')
+          : r.status < 300
+            ? line('✅ GitHub：读写正常')
+            : line('❌ GitHub：' + esc(Backends.repo.err(r.status, r.text))));
+      } catch (e) {
+        out.push(line('❌ GitHub：' + esc(e.message)));
+      }
+    } else {
+      out.push(line('— GitHub：没配'));
+    }
+
+    // ---- 坚果云 ----
+    if (Backends.dav.ready()) {
+      try {
+        const root = new URL(DB.d.cfg.davUrl).origin + '/dav/';
+        const r = await GMx.req(root, {
+          method: 'PROPFIND',
+          headers: Object.assign({ Depth: '1' }, Backends.dav.hdr()),
+        });
+        if (r.status >= 300) {
+          out.push(line('❌ 坚果云：' + esc(Backends.dav.err(r.status, r.text))));
+        } else {
+          const names = [...String(r.text).matchAll(/<[^>]*href>(.*?)<\/[^>]*href>/gi)]
+            .map((m) => decodeURIComponent(m[1]).replace(/\/+$/, '').split('/').pop())
+            .filter((x) => x && x !== 'dav');
+          const uniq = [...new Set(names)];
+          const mine = decodeURIComponent(new URL(DB.d.cfg.davUrl).pathname)
+            .split('/').filter(Boolean)[1] || '';
+          out.push(line('✅ 坚果云：连得上。你的同步文件夹：<b>' +
+            uniq.map(esc).join('</b>、<b>') + '</b>'));
+          out.push(uniq.includes(mine)
+            ? line(`✅ 地址里用的「${esc(mine)}」对得上`)
+            : line(`❌ 地址里写的是「${esc(mine)}」，不在上面的列表里 —— 照着改一下`));
+
+          // 真正写一次才知道有没有写权限（账户过期这类只有写的时候才报）
+          const probe = DB.d.cfg.davUrl.replace(/[^/]+$/, 'fw-marks-selftest.json');
+          const w = await GMx.req(probe, {
+            method: 'PUT', headers: Backends.dav.hdr(), body: '{"selftest":true}',
+          });
+          if (w.status < 300) {
+            await GMx.req(probe, { method: 'DELETE', headers: Backends.dav.hdr() });
+            out.push(line('✅ 坚果云：写权限正常'));
+          } else {
+            out.push(line('❌ 坚果云写入失败：' + esc(Backends.dav.err(w.status, w.text))));
+          }
+        }
+      } catch (e) {
+        out.push(line('❌ 坚果云：' + esc(e.message)));
+      }
+    } else {
+      out.push(line('— 坚果云：没配'));
+    }
+
+    box.innerHTML = `<div class="hint" style="background:#f7f7f9;padding:10px;
+      border-radius:9px;margin-top:10px;line-height:1.8">${out.join('')}</div>`;
   }
 
   // ---- 设置 / 同步 ----
@@ -1512,7 +1686,10 @@
       </div>
 
       <div class="row">
-        <label>① GitHub 私有仓库　${st('repo')}</label>
+        <label>① GitHub 私有仓库　${c.repoOn ? st('repo') : ''}
+          <span class="sw ${c.repoOn ? 'on' : ''}" data-backon="repo">${c.repoOn ? '已启用' : '已关闭'}</span>
+        </label>
+        ${!c.repoOn ? '' : `
         <input type="password" data-token placeholder="Token：github_pat_…（细粒度）" value="${esc(c.token)}">
         <input type="text" data-repo placeholder="仓库：owner/仓库名" value="${esc(c.repo)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
         <input type="text" data-repopath placeholder="文件路径（默认 fw-marks.json）" value="${esc(c.repoPath)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
@@ -1523,11 +1700,14 @@
           Permissions 里只给 <b>Contents: Read and write</b> 就够喵。<br>
           文件不存在会自动创建。<b>别用公共仓库</b> —— 这里存的是你读了什么、标了什么。
           ${c.repo ? `<br>👉 <a href="https://github.com/${esc(c.repo)}" target="_blank">打开这个仓库</a>` : ''}
-        </div>
+        </div>`}
       </div>
 
       <div class="row">
-        <label>② 坚果云 WebDAV　${st('dav')}</label>
+        <label>② 坚果云 WebDAV　${c.davOn ? st('dav') : ''}
+          <span class="sw ${c.davOn ? 'on' : ''}" data-backon="dav">${c.davOn ? '已启用' : '已关闭'}</span>
+        </label>
+        ${!c.davOn ? '' : `
         <input type="text" data-davurl placeholder="WebDAV 文件地址" value="${esc(c.davUrl)}">
         <input type="text" data-davuser placeholder="账号（坚果云注册邮箱）" value="${esc(c.davUser)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
         <input type="password" data-davpass placeholder="应用密码（不是登录密码！）" value="${esc(c.davPass)}" style="margin-top:7px">
@@ -1536,8 +1716,10 @@
           （<b>不是登录密码</b>）。<br>
           地址<b>必须带上文件夹那一层</b>：<code>…/dav/文件夹名/fw-marks.json</code>。<br>
           坚果云的 <code>/dav/</code> 根目录只是同步文件夹的列表，直接往根上写会被拒；
-          <b>文件夹要先在坚果云里存在</b>（默认就有「我的坚果云」）。
-        </div>
+          <b>文件夹要先在坚果云里存在</b>（默认就有「我的坚果云」）。<br>
+          WebDAV <b>不需要付费</b>，免费版就能用；免费版限的是流量
+          （每月 1GB 上传 / 3GB 下载）和请求频率，不是功能。
+        </div>`}
       </div>
 
       <div class="row">
@@ -1546,7 +1728,9 @@
       <div class="btns">
         <button class="btn" data-act="saveCfg">保存设置</button>
         <button class="btn g" data-act="syncNow">立即同步</button>
+        <button class="btn g" data-act="diag">🔍 测试连接</button>
       </div>
+      <div data-diag></div>
       <div class="hint">Token 和密码<b>只存在这台设备</b>，永远不会被传到任何云端喵。</div>
       <div class="row" style="margin-top:22px">
         <label>本地备份</label>
@@ -1575,8 +1759,35 @@
   // ==========================================================================
   sBody.addEventListener('click', async (e) => {
     const t = e.target.closest('[data-mark],[data-act],[data-go],[data-tag],[data-jump],[data-del],' +
-      '[data-toggle],[data-bmkgo],[data-bmkdel],[data-bmktoggle]');
+      '[data-toggle],[data-bmkgo],[data-bmkdel],[data-bmktoggle],[data-tab],' +
+      '[data-progdel],[data-backon]');
     if (!t) return;
+
+    // 某个云端的总开关：关掉就不参与同步，设置里也折叠起来不占地方
+    if (t.dataset.backon) {
+      const k = t.dataset.backon === 'repo' ? 'repoOn' : 'davOn';
+      DB.d.cfg[k] = !DB.d.cfg[k];
+      await DB.saveNow();
+      toast(DB.d.cfg[k] ? '已启用' : '已关闭，不再参与同步');
+      render();
+      return;
+    }
+
+    // ---- 「我的标记」的三个 subtab ----
+    if (t.dataset.tab) {
+      allTab = t.dataset.tab;
+      render();
+      sBody.scrollTop = 0;
+      return;
+    }
+    // 单独清掉某本书的阅读进度（书和标记都留着）
+    if (t.dataset.progdel) {
+      const pg = DB.prog(t.dataset.progdel);
+      if (pg) { pg.deleted = true; DB.touch(pg); }
+      toast('已清除这本的进度');
+      render(); paintAll();
+      return;
+    }
 
     // ---- 书签 ----
     if (t.dataset.bmkgo) {
@@ -1683,16 +1894,25 @@
         jumpTo(DB.prog(Page.bid));
         break;
       case 'saveCfg': {
-        const v = (s) => sBody.querySelector(s).value.trim();
-        DB.d.cfg.token = v('[data-token]');
-        DB.d.cfg.repo = v('[data-repo]');
-        DB.d.cfg.repoPath = v('[data-repopath]') || 'fw-marks.json';
-        DB.d.cfg.repoBranch = v('[data-repobranch]');
+        // 关掉的那一段是折叠起来的，输入框根本不在 DOM 里 ——
+        // 拿不到就跳过那一项，别把已有配置清空、更别直接抛错
+        const v = (sel) => {
+          const el = sBody.querySelector(sel);
+          return el ? el.value.trim() : undefined;
+        };
+        const set = (key, val, dflt) => {
+          if (val !== undefined) DB.d.cfg[key] = val || dflt || '';
+        };
+        set('token', v('[data-token]'));
+        set('repo', v('[data-repo]'));
+        set('repoPath', v('[data-repopath]'), 'fw-marks.json');
+        set('repoBranch', v('[data-repobranch]'));
         Backends.repo._sha = null;   // 换了仓库/路径，旧的文件版本号就作废了
-        DB.d.cfg.davUrl = v('[data-davurl]');
-        DB.d.cfg.davUser = v('[data-davuser]');
-        DB.d.cfg.davPass = v('[data-davpass]');
-        DB.d.cfg.autoSync = sBody.querySelector('[data-auto]').checked;
+        set('davUrl', v('[data-davurl]'));
+        set('davUser', v('[data-davuser]'));
+        set('davPass', v('[data-davpass]'));
+        const auto = sBody.querySelector('[data-auto]');
+        if (auto) DB.d.cfg.autoSync = auto.checked;
         await DB.saveNow();
         const on = Object.values(Backends).filter((b) => b.ready()).length;
         toast(on === 2 ? '双备份已就绪喵 ✓' : on === 1 ? '已保存（只配了一个云端喵）' : '已保存');
@@ -1700,6 +1920,7 @@
         break;
       }
       case 'syncNow': await Sync.run(false); break;
+      case 'diag': await runDiag(); break;
       case 'export': {
         const json = JSON.stringify(Sync.snapshot(), null, 1);
         try {
@@ -2048,7 +2269,7 @@
       `border-radius:12px;cursor:pointer;background:#8881;color:#666">${txt}</span>`;
     const html =
       btn('book', `📖 标签 / 总评 / 书签${nb ? ' 🔖' + nb : ''}`) +
-      btn('all', `📚 全部标记${nc ? ' · 本书 ' + nc + ' 章' : ''}`) +
+      btn('all', `📚 我的标记${nc ? ' · 本书 ' + nc + ' 章' : ''}`) +
       btn('cfg', '⚙️');
     if (bar.innerHTML !== html) bar.innerHTML = html;
   }
