@@ -155,7 +155,7 @@ SEED = {
     },
     'tagPool': ['追更中', '甜文', '弃坑', '列表验证'],
     'site': {},
-    'cfg': {'token': '', 'repo': '', 'davUrl': '', 'davUser': '', 'davPass': '', 'autoSync': False},
+    'cfg': {'token': '', 'repo': '', 'repoDir': 'fw-marks', 'davDir': '', 'davUser': '', 'davPass': '', 'autoSync': False},
     'lastSync': 9999999999999,
     'status': {},
     # 默认就标成「已迁移」，否则测试台每开一页都重灌一次种子、
@@ -612,6 +612,13 @@ def static_checks():
                    bool(re.search(r"ready: \(\) => !!\(DB\.d\.cfg\.davOn", s))))
     checks.append(('设置里两段都有开关',
                    s.count('data-backon=') >= 2))
+    # 分表同步：文件清单要从 COLLECTIONS 推导，别写死 —— 否则以后加表会忘
+    checks.append(('同步文件清单从 COLLECTIONS 推导',
+                   'COLLECTIONS.map((k) => k + \'.json\')' in s))
+    # 每个文件的内容也必须是白名单式的，不能把 cfg 带进去
+    body = body_of(r'fileBody\(name\)\s*\{.*?\n    \},')
+    checks.append(('同步文件内容里不含凭据',
+                   bool(body) and not any(x in code_only(body) for x in ('cfg', 'token', 'davPass'))))
     checks.append(('同步的表清单是白名单，且不含 cfg',
                    bool(coll) and 'cfg' not in coll and
                    set(coll) == {'books', 'chaps', 'bmks', 'prog'}))

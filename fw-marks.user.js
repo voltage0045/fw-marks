@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.7.2
+// @version      1.8.0
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -143,9 +143,12 @@
       this.d.cfg = Object.assign({
         // GitHub 私有仓库。凭据只存本机，snapshot() 是白名单式的，永不上传
         repoOn: true, davOn: true,   // 各自的总开关，关掉就完全不用它
-        token: '', repo: '', repoPath: 'fw-marks.json', repoBranch: '',
+        // 填的是「文件夹」，里面放哪些文件由脚本自己定（一个表一个文件）
+        token: '', repo: '', repoDir: 'fw-marks', repoBranch: '',
+        repoPath: '',                // 旧版的单文件路径，只用来读一次老数据
         // 必须带上文件夹那一层：坚果云不让直接写在 /dav/ 根目录
-        davUrl: 'https://dav.jianguoyun.com/dav/我的坚果云/fw-marks.json',
+        davDir: 'https://dav.jianguoyun.com/dav/我的坚果云/fw-marks/',
+        davUrl: '',                  // 旧版的单文件地址，只用来读一次老数据
         davUser: '', davPass: '',
         autoSync: true,
       }, this.d.cfg || {});
@@ -167,7 +170,8 @@
      * 顺序有意义：mig1 先把假记录清掉，mig2 才不会把假进度搬进新表。
      */
     migrate() {
-      const steps = [['mig1', '_mig1'], ['mig2', '_mig2'], ['mig3', '_mig3']];
+      const steps = [['mig1', '_mig1'], ['mig2', '_mig2'], ['mig3', '_mig3'],
+                     ['mig4', '_mig4']];
       let n = 0, ran = false;
       for (const [flag, fn] of steps) {
         if (this.d[flag]) continue;
@@ -187,6 +191,25 @@
 
     // v1.5.1：把历史上已经同步出来的重复书签收掉
     _mig3() { return this.dedupeBmks(); },
+
+    /*
+     * v1.8：同步从「一个大文件」改成「一个文件夹、一表一文件」。
+     * 配置里原来填的是文件路径，这里把文件夹部分推出来当新配置 ——
+     * 用户不用重填。老路径保留，首次同步会读它一次，把老数据并进来。
+     */
+    _mig4() {
+      const c = this.d.cfg;
+      let n = 0;
+      if (c.davUrl && !/\/$/.test(c.davDir || '')) {
+        c.davDir = c.davUrl.replace(/[^/]+$/, '');   // 去掉文件名，只留文件夹
+        n++;
+      }
+      if (c.repoPath && c.repoPath.includes('/')) {
+        c.repoDir = c.repoPath.replace(/\/[^/]+$/, '');
+        n++;
+      }
+      return n;
+    },
 
     /*
      * 把老形状 books[bid].progress 搬进 prog 表。
@@ -405,37 +428,41 @@
   };
 
   // ---- 云端后端：两个都实现同一套 {ready, pull, push} 接口 ----
+  /*
+   * 云端后端。两边实现同一套接口：ready / ensureDir / get(name) / put(name,text) / getLegacy
+   *
+   * 「一个表一个文件」而不是整包一个 JSON：
+   *   · 只改了进度就只推 prog.json，别的文件一个字节都不动 —— 省流量
+   *     （坚果云免费版每月就 1GB 上传）
+   *   · 以后分表只是多一个文件，同步逻辑一行都不用动
+   * 所以配置里填的是**文件夹**，具体文件名由脚本自己定。
+   */
+  const SYNC_FILES = () => [...COLLECTIONS.map((k) => k + '.json'), 'meta.json'];
+  const LEGACY_FILE = 'fw-marks.json';   // v1.7 及以前的整包单文件
+
   const Backends = {
-    /*
-     * GitHub 私有仓库（Contents API）。
-     * 为什么不用 gist：gist 的 public:false 只是「不被列出」，拿到链接谁都能看，
-     * 不是鉴权存储。私有仓库是真鉴权的。
-     * 顺带一个好处：细粒度 PAT 可以只授权这一个仓库的 Contents 读写，
-     * 比 classic token 的 `gist` scope（能读写你名下所有 gist）爆炸半径小得多。
-     */
     repo: {
       label: 'GitHub 私有仓库',
       ready: () => !!(DB.d.cfg.repoOn && DB.d.cfg.token && DB.d.cfg.repo),
-      _sha: null,          // 上次见到的文件版本号，PUT 更新时必须带上
+      _sha: {},          // 文件名 → 版本号，PUT 更新时必须带上
       hdr: () => ({
         Authorization: 'Bearer ' + DB.d.cfg.token,
         Accept: 'application/vnd.github+json',
         'X-GitHub-Api-Version': '2022-11-28',
         'Content-Type': 'application/json',
       }),
-      api() {
+      dir() { return (DB.d.cfg.repoDir || '').trim().replace(/^\/+|\/+$/g, ''); },
+      api(path) {
         const repo = (DB.d.cfg.repo || '').trim().replace(/^\/+|\/+$|\.git$/g, '');
-        const path = (DB.d.cfg.repoPath || 'fw-marks.json').trim().replace(/^\/+/, '');
         const br = (DB.d.cfg.repoBranch || '').trim();
         return {
-          base: 'https://api.github.com/repos/' + repo + '/contents/' +
-                path.split('/').map(encodeURIComponent).join('/'),
+          url: 'https://api.github.com/repos/' + repo + '/contents/' +
+               path.split('/').filter(Boolean).map(encodeURIComponent).join('/'),
           ref: br ? '?ref=' + encodeURIComponent(br) : '',
           branch: br,
         };
       },
       err(status, body) {
-        // GitHub 会在 JSON 里写清楚原因，带上比只给状态码有用
         let why = '';
         try { why = (JSON.parse(body || '{}').message || ''); } catch (e) {}
         const base = status === 401 ? 'Token 无效或已过期'
@@ -444,119 +471,141 @@
           : 'HTTP ' + status;
         return why ? base + '（' + why + '）' : base;
       },
-      async pull() {
-        const { base, ref } = this.api();
-        const r = await GMx.req(base + ref, { headers: this.hdr() });
-        if (r.status === 404) { this._sha = null; return null; } // 文件还没建，第一次用
+      async ensureDir() { /* GitHub 的目录是隐式的，写文件时自动就有了 */ },
+      async fetchPath(path) {
+        const { url, ref } = this.api(path);
+        const r = await GMx.req(url + ref, { headers: this.hdr() });
+        if (r.status === 404) return { missing: true };
         if (r.status >= 300) throw new Error(this.err(r.status, r.text));
         const j = JSON.parse(r.text);
-        this._sha = j.sha || null;
-        if (!j.content) return null;
-        return JSON.parse(unb64(j.content));
+        return { text: j.content ? unb64(j.content) : '', sha: j.sha || null };
       },
-      async push(snap) {
-        const { base, branch } = this.api();
+      async get(name) {
+        const path = (this.dir() ? this.dir() + '/' : '') + name;
+        const r = await this.fetchPath(path);
+        if (r.missing) { delete this._sha[name]; return { missing: true }; }
+        this._sha[name] = r.sha;
+        return { text: r.text };
+      },
+      async put(name, text) {
+        const path = (this.dir() ? this.dir() + '/' : '') + name;
+        const { url, branch } = this.api(path);
         const body = () => {
-          const o = {
-            message: '废文网书签同步（脚本自动提交）',
-            content: b64(JSON.stringify(snap)),
-          };
-          if (this._sha) o.sha = this._sha;
+          const o = { message: '废文网标记同步：' + name, content: b64(text) };
+          if (this._sha[name]) o.sha = this._sha[name];
           if (branch) o.branch = branch;
           return JSON.stringify(o);
         };
-        let r = await GMx.req(base, { method: 'PUT', headers: this.hdr(), body: body() });
-        // 409/422 = 手里的 sha 过期了（别的设备刚推过）。重新取一次再试一遍
+        let r = await GMx.req(url, { method: 'PUT', headers: this.hdr(), body: body() });
+        // 409/422 = 手里的 sha 过期了（别的设备刚推过），重取再试一次
         if (r.status === 409 || r.status === 422) {
-          await this.pull();
-          r = await GMx.req(base, { method: 'PUT', headers: this.hdr(), body: body() });
+          try { await this.get(name); } catch (e) {}
+          r = await GMx.req(url, { method: 'PUT', headers: this.hdr(), body: body() });
         }
         if (r.status >= 300) throw new Error(this.err(r.status, r.text));
         const j = JSON.parse(r.text || '{}');
-        if (j.content && j.content.sha) this._sha = j.content.sha; // 记住新 sha，下次省一次 GET
+        if (j.content && j.content.sha) this._sha[name] = j.content.sha;
+      },
+      // v1.7 及以前那份整包文件，迁移时读一次
+      async getLegacy() {
+        const path = (DB.d.cfg.repoPath || LEGACY_FILE).trim().replace(/^\/+/, '');
+        return this.fetchPath(path);
       },
     },
 
     dav: {
       label: '坚果云',
-      ready: () => !!(DB.d.cfg.davOn && DB.d.cfg.davUrl && DB.d.cfg.davUser && DB.d.cfg.davPass),
+      ready: () => !!(DB.d.cfg.davOn && DB.d.cfg.davDir &&
+                      DB.d.cfg.davUser && DB.d.cfg.davPass),
       hdr: () => ({
         Authorization: 'Basic ' + b64(DB.d.cfg.davUser + ':' + DB.d.cfg.davPass),
         'Content-Type': 'application/json; charset=utf-8',
-        // 用 header 防缓存，不用 ?t= 查询串 —— 有些 WebDAV 服务端会把带查询串的路径当成另一个文件
+        // 用 header 防缓存，不用 ?t= 查询串 —— 有些 WebDAV 会把带查询串的路径当成另一个文件
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache',
       }),
+      dir() { return (DB.d.cfg.davDir || '').trim().replace(/\/*$/, '/'); },
       /*
-       * 地址必须指到「某个同步文件夹里面」。
-       * 坚果云的 WebDAV 根目录（/dav/ 下面那一层）只是同步文件夹的列表，
-       * 直接往根上建文件是不允许的 —— 会回 403/409，而且报错文字看不出所以然。
-       * 所以这里先自己检查一遍路径层级，把话说明白。
+       * 坚果云的 /dav/ 根目录只是同步文件夹的列表，不让在上面直接建东西。
+       * 所以文件夹至少要有两段：/dav/<同步文件夹>/…
        */
       rootPath() {
         try {
-          const p = new URL(DB.d.cfg.davUrl).pathname.replace(/^\/+|\/+$/g, '');
-          // 正常是 dav/文件夹/文件名 → 至少 3 段；dav/文件名 只有 2 段
-          return p.split('/').filter(Boolean).length < 3;
+          const p = new URL(this.dir()).pathname.replace(/^\/+|\/+$/g, '');
+          return p.split('/').filter(Boolean).length < 2;
         } catch (e) { return false; }
       },
-      /*
-       * 坚果云出错时会在正文里自报原因（<s:exception>），比 HTTP 状态码
-       * 有用得多 —— 比如 AccountExpired 一眼就知道是账户过期，
-       * 而状态码只是个 403，会让人以为是权限配错了。优先用它。
-       */
       err(status, body) {
+        // 坚果云出错时会在正文里自报原因，比状态码有用得多
         const ex = (/<s:exception>(.*?)<\/s:exception>/.exec(body || '') || [])[1];
         const known = {
-          AccountExpired: '坚果云账户已过期 —— 去坚果云续期；或者先只用 GitHub 那一路',
+          AccountExpired: '坚果云账户已过期或当月流量用尽（免费版每月 1GB 上传，次月重置）',
           NoPermission: '这个文件夹没有写权限（是别人共享给你的只读文件夹？）',
           OverQuota: '坚果云空间或流量用完了',
           InvalidAuth: '账号或应用密码不对（要用「应用密码」，不是登录密码）',
         }[ex];
         if (known) return known;
-        if (ex) return ex;   // 没见过的异常名，原样报出来总比只给状态码强
-
+        if (ex) return ex;
         if (status === 401) return '账号或应用密码不对（要用「应用密码」，不是登录密码）';
-        if (status === 403) return this.rootPath()
-          ? '坚果云不让直接写在根目录，地址要改成 …/dav/某个文件夹/fw-marks.json'
-          : '没有写权限';
+        if (status === 403) return '没有写权限';
         if (status === 404) return '路径不存在';
-        if (status === 409) return '上级文件夹在坚果云里不存在，先去建好';
+        if (status === 409) return '上级文件夹不存在，先去坚果云里建好';
         if (status === 507) return '坚果云空间满了';
         return 'HTTP ' + status;
       },
-      async pull() {
+      // 文件夹不存在就建一个。MKCOL 幂等：已存在会回 405，当成功处理
+      async ensureDir() {
         if (this.rootPath()) {
-          throw new Error('地址指到了根目录。改成 …/dav/某个文件夹/fw-marks.json');
+          throw new Error('地址要指到 …/dav/某个同步文件夹/ 下面，不能是 /dav/ 根目录');
         }
-        const r = await GMx.req(DB.d.cfg.davUrl, { headers: this.hdr() });
-        if (r.status === 404) return null; // 文件还不存在，第一次用
-        if (r.status >= 300) throw new Error(this.err(r.status, r.text));
-        if (!r.text || !r.text.trim()) return null;
-        try { return JSON.parse(r.text); }
-        catch (e) { throw new Error('云端文件不是合法 JSON（被别的东西覆盖了？）'); }
+        const r = await GMx.req(this.dir(), { method: 'MKCOL', headers: this.hdr() });
+        if (r.status < 300 || r.status === 405) return;
+        throw new Error(this.err(r.status, r.text));
       },
-      async push(snap) {
-        if (this.rootPath()) {
-          throw new Error('地址指到了根目录。改成 …/dav/某个文件夹/fw-marks.json');
-        }
-        const r = await GMx.req(DB.d.cfg.davUrl, {
-          method: 'PUT', headers: this.hdr(), body: JSON.stringify(snap),
+      async get(name) {
+        const r = await GMx.req(this.dir() + name, { headers: this.hdr() });
+        if (r.status === 404) return { missing: true };
+        if (r.status >= 300) throw new Error(this.err(r.status, r.text));
+        return { text: r.text || '' };
+      },
+      async put(name, text) {
+        const r = await GMx.req(this.dir() + name, {
+          method: 'PUT', headers: this.hdr(), body: text,
         });
         if (r.status >= 300) throw new Error(this.err(r.status, r.text));
+      },
+      async getLegacy() {
+        if (!DB.d.cfg.davUrl) return { missing: true };
+        const r = await GMx.req(DB.d.cfg.davUrl, { headers: this.hdr() });
+        if (r.status === 404) return { missing: true };
+        if (r.status >= 300) return { missing: true };
+        return { text: r.text || '' };
       },
     },
   };
 
   const Sync = {
     busy: false,
-    // 只把需要跨设备的部分传上去；token / 密码绝不上传
-    snapshot() {
-      // 白名单式：只列要传的东西。cfg（token / 应用密码）永远不在里面
-      const snap = { v: 1, tagPool: DB.d.tagPool, site: DB.d.site, savedAt: now() };
-      COLLECTIONS.forEach((k) => { snap[k] = DB.d[k]; });
-      return snap;
+
+    /*
+     * 键排序后再序列化。
+     * 两台设备合并出来的 key 顺序可能不同，不排的话内容明明一样也会被判成
+     * 「变了」，白推一次 —— 而「没变就不推」正是省流量的关键。
+     */
+    stable(v) {
+      if (v === null || typeof v !== 'object') return JSON.stringify(v);
+      if (Array.isArray(v)) return '[' + v.map((x) => this.stable(x)).join(',') + ']';
+      return '{' + Object.keys(v).sort().map((k) =>
+        JSON.stringify(k) + ':' + this.stable(v[k])).join(',') + '}';
     },
+
+    // 每个文件当前该长什么样。凭据永远不在里面（白名单式）
+    fileBody(name) {
+      if (name === 'meta.json') return { v: 1, tagPool: DB.d.tagPool, site: DB.d.site };
+      return { v: 1, data: DB.d[name.replace(/\.json$/, '')] || {} };
+    },
+    fileText(name) { return this.stable(this.fileBody(name)); },
+
     // 合并：同一条记录谁的 updatedAt 新就留谁
     mergeMap(local, remote) {
       const out = Object.assign({}, local);
@@ -566,24 +615,44 @@
       }
       return out;
     },
-    apply(remote) {
-      if (!remote || remote.v !== 1) throw new Error('数据格式不认识');
-      COLLECTIONS.forEach((k) => {
-        DB.d[k] = this.mergeMap(DB.d[k], remote[k] || {});
-      });
-      // 老版本的云端数据里进度还塞在书记录里，合并完顺手搬到 prog 表
-      DB.migrateLegacyProgress();
-      // 两台设备各自在同一位置加过书签的话，key 不同、合并后会并排留下来，
-      // 这里收掉。选谁留是确定性的，所以各设备算出来的结果一致
-      DB.dedupeBmks();
-      DB.d.tagPool = [...new Set([...DB.d.tagPool, ...(remote.tagPool || [])])];
-      if (remote.site && !Object.keys(DB.d.site).length) DB.d.site = remote.site;
+
+    applyFile(name, obj) {
+      if (!obj || obj.v !== 1) throw new Error('数据格式不认识');
+      if (name === 'meta.json') {
+        DB.d.tagPool = [...new Set([...DB.d.tagPool, ...(obj.tagPool || [])])];
+        if (obj.site && !Object.keys(DB.d.site).length) DB.d.site = obj.site;
+        return;
+      }
+      const k = name.replace(/\.json$/, '');
+      if (!COLLECTIONS.includes(k)) return;
+      DB.d[k] = this.mergeMap(DB.d[k], obj.data || {});
     },
 
+    // v1.7 及以前的整包格式（云端老文件、以及「粘贴导入」都走这里）
+    applyLegacy(obj) {
+      if (!obj || obj.v !== 1) throw new Error('数据格式不认识');
+      COLLECTIONS.forEach((k) => { DB.d[k] = this.mergeMap(DB.d[k], obj[k] || {}); });
+      DB.d.tagPool = [...new Set([...DB.d.tagPool, ...(obj.tagPool || [])])];
+      if (obj.site && !Object.keys(DB.d.site).length) DB.d.site = obj.site;
+    },
+
+    // 合并完统一做的收尾
+    afterMerge() {
+      DB.migrateLegacyProgress();   // 老设备推上来的进度还塞在书记录里
+      DB.dedupeBmks();              // 两台设备在同一位置各加过书签
+    },
+
+    // 导出/导入用的整包格式，保持不变
+    snapshot() {
+      const snap = { v: 1, tagPool: DB.d.tagPool, site: DB.d.site, savedAt: now() };
+      COLLECTIONS.forEach((k) => { snap[k] = DB.d[k]; });
+      return snap;
+    },
+    apply(remote) { this.applyLegacy(remote); this.afterMerge(); },
+
     /*
-     * 一轮同步：两边都拉 → 和本地逐条比时间戳合并 → 合并结果推回两边。
-     * 所以「取最新的、更新落后的」是自动的：哪边旧，push 时就被补齐。
-     * 某一边挂掉不影响另一边 —— 用 allSettled，各报各的成败。
+     * 一轮同步：逐文件拉 → 逐条比时间戳合并 → 只把「变了的文件」推回去。
+     * 某一边挂掉不影响另一边，各报各的成败。
      */
     async run(silent) {
       if (this.busy) return;
@@ -593,35 +662,58 @@
       if (!silent) toast('同步中…', 0);
 
       const errs = [], oks = [];
-      try {
-        // 1) 并发拉取
-        const pulled = await Promise.allSettled(active.map(([, b]) => b.pull()));
-        pulled.forEach((res, i) => {
-          const [key, b] = active[i];
-          if (res.status === 'fulfilled') {
-            if (res.value) {
-              try { this.apply(res.value); }
-              catch (e) { errs.push(`${b.label}拉取：${e.message}`); }
-            }
-          } else {
-            errs.push(`${b.label}拉取：${res.reason.message}`);
-            DB.d.status[key] = { ok: false, ts: now(), err: res.reason.message };
-          }
-        });
+      const files = SYNC_FILES();
+      const fail = (key, label, msg) => {
+        errs.push(`${label}：${msg}`);
+        DB.d.status[key] = { ok: false, ts: now(), err: msg };
+      };
 
-        // 2) 合并后的完整快照推回每一边（落后的那边就此被补齐）
-        const snap = this.snapshot();
-        const pushed = await Promise.allSettled(active.map(([, b]) => b.push(snap)));
-        pushed.forEach((res, i) => {
-          const [key, b] = active[i];
-          if (res.status === 'fulfilled') {
-            oks.push(b.label);
-            DB.d.status[key] = { ok: true, ts: now(), err: '' };
-          } else {
-            errs.push(`${b.label}上传：${res.reason.message}`);
-            DB.d.status[key] = { ok: false, ts: now(), err: res.reason.message };
+      try {
+        // 0) 文件夹不在就建（坚果云要，GitHub 不用）。建不出来的这一边直接跳过
+        const usable = [];
+        for (const [key, b] of active) {
+          try { await b.ensureDir(); usable.push([key, b]); }
+          catch (e) { fail(key, b.label, e.message); }
+        }
+
+        // 1) 逐文件拉取合并。记下每边拿到的原文，第 2 步据此判断要不要推
+        const got = {};
+        for (const [key, b] of usable) {
+          got[key] = {};
+          let any = false;
+          for (const f of files) {
+            try {
+              const r = await b.get(f);
+              if (r.missing) { got[key][f] = null; continue; }
+              got[key][f] = r.text;
+              any = true;
+              if (r.text) this.applyFile(f, JSON.parse(r.text));
+            } catch (e) { got[key][f] = undefined; fail(key, b.label + ' ' + f, e.message); }
           }
-        });
+          // 分表文件一个都没有 → 可能是 v1.7 及以前的整包数据，并进来
+          if (!any && b.getLegacy) {
+            try {
+              const r = await b.getLegacy();
+              if (!r.missing && r.text) this.applyLegacy(JSON.parse(r.text));
+            } catch (e) { /* 老文件没有就算了，不算错 */ }
+          }
+        }
+        this.afterMerge();
+
+        // 2) 只推「和拉下来那份不一样」的文件
+        for (const [key, b] of usable) {
+          let ok = true, pushed = 0;
+          for (const f of files) {
+            const text = this.fileText(f);
+            if (got[key] && got[key][f] === text) continue;   // 没变，省一次请求
+            try { await b.put(f, text); pushed++; }
+            catch (e) { ok = false; fail(key, b.label + ' ' + f, e.message); }
+          }
+          if (ok) {
+            oks.push(b.label + (pushed ? `(${pushed})` : ''));
+            DB.d.status[key] = { ok: true, ts: now(), err: '' };
+          }
+        }
 
         if (oks.length) DB.d.lastSync = now();
         await DB.saveNow();
@@ -1609,37 +1701,34 @@
   async function runDiag() {
     const box = sBody.querySelector('[data-diag]');
     if (!box) return;
-    const line = (s) => `<div style="margin:3px 0">${s}</div>`;
-    box.innerHTML = `<div class="hint">检查中…</div>`;
+    const line = (t) => `<div style="margin:3px 0">${t}</div>`;
+    box.innerHTML = '<div class="hint">检查中…</div>';
     const out = [];
-    // 诊断结论要顺手写回状态，否则上面那行还挂着「上次同步」的旧报错，
-    // 和刚跑出来的结果自相矛盾
+    // 诊断结论要写回状态，否则上面那行还挂着「上次同步」的旧报错，自相矛盾
     const mark = (key, ok, err) => { DB.d.status[key] = { ok, ts: now(), err: err || '' }; };
 
     // ---- GitHub 私有仓库 ----
     if (Backends.repo.ready()) {
       try {
-        const { base, ref } = Backends.repo.api();
-        const r = await GMx.req(base + ref, { headers: Backends.repo.hdr() });
-        const good = r.status < 300 || r.status === 404;
-        mark('repo', good, good ? '' : Backends.repo.err(r.status, r.text));
-        out.push(r.status === 404
-          ? line('✅ GitHub：仓库能访问，数据文件还没建（首次同步会自动创建）')
-          : r.status < 300
-            ? line('✅ GitHub：读写正常')
-            : line('❌ GitHub：' + esc(Backends.repo.err(r.status, r.text))));
+        const r = await Backends.repo.get('meta.json');
+        mark('repo', true, '');
+        out.push(line(r.missing
+          ? '✅ GitHub：仓库和文件夹能访问，数据文件还没建（首次同步会自动创建）'
+          : '✅ GitHub：读写正常'));
       } catch (e) {
         mark('repo', false, e.message);
         out.push(line('❌ GitHub：' + esc(e.message)));
       }
     } else {
-      out.push(line('— GitHub：没配'));
+      out.push(line('— GitHub：没配或已关闭'));
     }
 
     // ---- 坚果云 ----
     if (Backends.dav.ready()) {
       try {
-        const root = new URL(DB.d.cfg.davUrl).origin + '/dav/';
+        const dir = Backends.dav.dir();
+        // 1) 先看账号下到底有哪些「同步文件夹」—— 地址里第一层写错是头号原因
+        const root = new URL(dir).origin + '/dav/';
         const r = await GMx.req(root, {
           method: 'PROPFIND',
           headers: Object.assign({ Depth: '1' }, Backends.dav.hdr()),
@@ -1652,34 +1741,31 @@
             .map((m) => decodeURIComponent(m[1]).replace(/\/+$/, '').split('/').pop())
             .filter((x) => x && x !== 'dav');
           const uniq = [...new Set(names)];
-          const mine = decodeURIComponent(new URL(DB.d.cfg.davUrl).pathname)
+          const first = decodeURIComponent(new URL(dir).pathname)
             .split('/').filter(Boolean)[1] || '';
           out.push(line('✅ 坚果云：连得上。你的同步文件夹：<b>' +
             uniq.map(esc).join('</b>、<b>') + '</b>'));
-          out.push(uniq.includes(mine)
-            ? line(`✅ 地址里用的「${esc(mine)}」对得上`)
-            : line(`❌ 地址里写的是「${esc(mine)}」，不在上面的列表里 —— 照着改一下`));
+          out.push(uniq.includes(first)
+            ? line(`✅ 地址第一层用的「${esc(first)}」对得上`)
+            : line(`❌ 地址第一层写的是「${esc(first)}」，不在上面的列表里 —— 照着改`));
 
-          // 真正写一次才知道有没有写权限（账户过期这类只有写的时候才报）
-          const probe = DB.d.cfg.davUrl.replace(/[^/]+$/, 'fw-marks-selftest.json');
-          const w = await GMx.req(probe, {
-            method: 'PUT', headers: Backends.dav.hdr(), body: '{"selftest":true}',
-          });
-          if (w.status < 300) {
-            await GMx.req(probe, { method: 'DELETE', headers: Backends.dav.hdr() });
-            mark('dav', true, '');
-            out.push(line('✅ 坚果云：写权限正常'));
-          } else {
-            mark('dav', false, Backends.dav.err(w.status, w.text));
-            out.push(line('❌ 坚果云写入失败：' + esc(Backends.dav.err(w.status, w.text))));
-          }
+          // 2) 子文件夹不存在就建出来（这一步本身也是在验写权限）
+          await Backends.dav.ensureDir();
+          out.push(line('✅ 坚果云：文件夹就绪（不存在的子文件夹已自动创建）'));
+
+          // 3) 真写一次再删掉 —— 账户过期/流量用尽这类只有写的时候才报
+          const probe = 'fw-marks-selftest.json';
+          await Backends.dav.put(probe, '{"selftest":true}');
+          await GMx.req(dir + probe, { method: 'DELETE', headers: Backends.dav.hdr() });
+          mark('dav', true, '');
+          out.push(line('✅ 坚果云：写权限正常'));
         }
       } catch (e) {
         mark('dav', false, e.message);
         out.push(line('❌ 坚果云：' + esc(e.message)));
       }
     } else {
-      out.push(line('— 坚果云：没配'));
+      out.push(line('— 坚果云：没配或已关闭'));
     }
 
     lastDiag = `<div class="hint" style="background:#f7f7f9;padding:10px;
@@ -1717,13 +1803,14 @@
         ${!c.repoOn ? '' : `
         <input type="password" data-token placeholder="Token：github_pat_…（细粒度）" value="${esc(c.token)}">
         <input type="text" data-repo placeholder="仓库：owner/仓库名" value="${esc(c.repo)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
-        <input type="text" data-repopath placeholder="文件路径（默认 fw-marks.json）" value="${esc(c.repoPath)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
+        <input type="text" data-repodir placeholder="文件夹（默认 fw-marks，留空＝仓库根目录）" value="${esc(c.repoDir)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
         <input type="text" data-repobranch placeholder="分支（留空＝仓库默认分支）" value="${esc(c.repoBranch)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
         <div class="hint">
           GitHub → Settings → Developer settings → <b>Fine-grained tokens</b> →
           Repository access 选 <b>Only select repositories</b> 挑你那个<b>私有</b>仓库 →
           Permissions 里只给 <b>Contents: Read and write</b> 就够喵。<br>
-          文件不存在会自动创建。<b>别用公共仓库</b> —— 这里存的是你读了什么、标了什么。
+          填<b>文件夹</b>（留空＝仓库根目录），里面的文件由脚本自己管，不存在会自动创建。<br>
+          <b>别用公共仓库</b> —— 这里存的是你读了什么、标了什么。
           ${c.repo ? `<br>👉 <a href="https://github.com/${esc(c.repo)}" target="_blank">打开这个仓库</a>` : ''}
         </div>`}
       </div>
@@ -1734,15 +1821,16 @@
             aria-checked="${!!c.davOn}" title="${c.davOn ? '已启用，点一下关闭' : '已关闭，点一下启用'}"></span>
         </label>
         ${!c.davOn ? '' : `
-        <input type="text" data-davurl placeholder="WebDAV 文件地址" value="${esc(c.davUrl)}">
+        <input type="text" data-davdir placeholder="WebDAV 文件夹地址（要以 / 结尾）" value="${esc(c.davDir)}">
         <input type="text" data-davuser placeholder="账号（坚果云注册邮箱）" value="${esc(c.davUser)}" style="margin-top:7px" autocapitalize="off" autocorrect="off">
         <input type="password" data-davpass placeholder="应用密码（不是登录密码！）" value="${esc(c.davPass)}" style="margin-top:7px">
         <div class="hint">
           坚果云 → 账户信息 → <b>安全选项</b> → 添加应用 → 生成的那串就是应用密码喵<br>
           （<b>不是登录密码</b>）。<br>
-          地址<b>必须带上文件夹那一层</b>：<code>…/dav/文件夹名/fw-marks.json</code>。<br>
-          坚果云的 <code>/dav/</code> 根目录只是同步文件夹的列表，直接往根上写会被拒；
-          <b>文件夹要先在坚果云里存在</b>（默认就有「我的坚果云」）。<br>
+          填<b>文件夹</b>，不是文件：<code>…/dav/同步文件夹/子文件夹/</code>（结尾带 /）。<br>
+          里面的文件由脚本自己管（一个表一个文件，只推改过的那个，省流量）。<br>
+          子文件夹<b>不存在会自动创建</b>；但 <code>…/dav/</code> 下的
+          <b>第一层同步文件夹必须已经存在</b> —— 根目录只是它们的列表，写不进去。<br>
           WebDAV <b>不需要付费</b>，免费版就能用；免费版限的是流量
           （每月 1GB 上传 / 3GB 下载）和请求频率，不是功能。
         </div>`}
@@ -1932,11 +2020,14 @@
         };
         set('token', v('[data-token]'));
         set('repo', v('[data-repo]'));
-        set('repoPath', v('[data-repopath]'), 'fw-marks.json');
+        set('repoDir', v('[data-repodir]'));
+        Backends.repo._sha = {};     // 换了文件夹，旧的文件版本号全作废
         set('repoBranch', v('[data-repobranch]'));
         Backends.repo._sha = null;   // 换了仓库/路径，旧的文件版本号就作废了
         lastDiag = '';               // 配置变了，上次的诊断结论就不作数了
-        set('davUrl', v('[data-davurl]'));
+        // 文件夹地址补上结尾的斜杠，不然拼出来的文件名会粘在一起
+        const dd = v('[data-davdir]');
+        if (dd !== undefined) DB.d.cfg.davDir = dd ? dd.replace(/\/*$/, '/') : '';
         set('davUser', v('[data-davuser]'));
         set('davPass', v('[data-davpass]'));
         const auto = sBody.querySelector('[data-auto]');
