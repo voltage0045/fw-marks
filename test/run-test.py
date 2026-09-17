@@ -163,6 +163,7 @@ SEED = {
     # 想验迁移的用例走 ?fwtest=legacy，那时才把这些标记去掉
     'mig1': True,
     'mig2': True,
+    'mig3': True,
 }
 
 # 各列表页的样本书也塞进种子，统一打「列表验证」标签
@@ -227,6 +228,9 @@ CHECK_JS = r"""
       markBtns: n('[data-fw-mark]'),
       bmkBtns: n('[data-fw-bmk]'),
       bmkSeeded: liveBmks().length,
+      // 同一章里还活着的书签（验跨设备去重）
+      dupLive: liveBmks().filter(function (m) { return m.cid === '__PID_BMK__'; }).length,
+      dupSurvivor: (liveBmks().filter(function (m) { return m.cid === '__PID_BMK__'; })[0] || {}).key || '',
       barMarked: barOf('__PID_BMK__'),
       barPlain: barOf('__PID_CLICK__'),
       renameBtns: n('[data-bmkname]'),
@@ -390,7 +394,18 @@ JUMP_POS = {
 def inject_html(html, query=''):
     # 全程用拼接，不用 % 格式化 —— 注入的内容里要是带个 % 就会被当成格式符炸掉
     data = SEED
-    if 'fwtest=deleted' in query:
+    if 'fwtest=dupbmk' in query:
+        # 模拟两台设备各自在「同一个位置」加过书签：key 不同、章内位置只差 2%。
+        # 去重应该只留一条，而且留的必须是 createdAt 更早的那条（确定性）
+        data = json.loads(json.dumps(SEED))
+        data.pop('mig3', None)
+        base = dict(SEED['bmks'][f'{TID}|{PIDS[1]}-1'])
+        later = dict(base)
+        later.update({'key': f'{TID}|{PIDS[1]}-999', 'cpct': 0.62,
+                      'createdAt': 9999, 'updatedAt': 9999})
+        data['bmks'][f'{TID}|{PIDS[1]}-999'] = later
+
+    elif 'fwtest=deleted' in query:
         # 书被「我的标记」里删掉之后，书籍详情页不该还显示「上次读到」。
         # 注意只删书、不动 prog —— 要验的正是「书没了，进度就不该再显示」
         data = json.loads(json.dumps(SEED))
@@ -629,6 +644,12 @@ def main():
             ('点顶栏入口能打开面板',   lambda r: r['navOpens'] is True),
             ('最近读的书排在列表最前', lambda r: (r.get('allListOrder') or [None])[0] == TID),
             ('页面链接没被挡住',       lambda r: not r['blockedLinks']),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=dupbmk', '跨设备重复书签 → 合并后要去重', [
+            ('同一位置只剩一条书签',   lambda r: r.get('dupLive') == 1),
+            ('留下的是先创建的那条（确定性）',
+             lambda r: r.get('dupSurvivor') == f'{TID}|{PIDS[1]}-1'),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}/profile?fwtest=deleted', '删掉的书 → 详情页不该再显示进度', [

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.5.0
+// @version      1.5.1
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -166,7 +166,7 @@
      * 顺序有意义：mig1 先把假记录清掉，mig2 才不会把假进度搬进新表。
      */
     migrate() {
-      const steps = [['mig1', '_mig1'], ['mig2', '_mig2']];
+      const steps = [['mig1', '_mig1'], ['mig2', '_mig2'], ['mig3', '_mig3']];
       let n = 0, ran = false;
       for (const [flag, fn] of steps) {
         if (this.d[flag]) continue;
@@ -183,6 +183,9 @@
      * 老数据的形状是 books[bid].progress，搬完把那个字段删掉。
      */
     _mig2() { return this.migrateLegacyProgress(); },
+
+    // v1.5.1：把历史上已经同步出来的重复书签收掉
+    _mig3() { return this.dedupeBmks(); },
 
     /*
      * 把老形状 books[bid].progress 搬进 prog 表。
@@ -322,6 +325,47 @@
     bmkNear(bid, cid, cpct, tol = 0.05) {
       return this.bmksOfChap(bid, cid).find((m) => Math.abs((m.cpct || 0) - (cpct || 0)) <= tol) || null;
     },
+    /*
+     * 跨设备去重。
+     * 书签的 key 带时间戳（书|章-1758…），所以同一个位置在两台设备上各加一次，
+     * key 不一样 → 合并时两条都留下来 → 冒出重复书签。
+     * 本地新建时那个 ±5% 的 bmkNear 只在「建的那一刻」生效，管不到合并。
+     *
+     * 留哪一条必须完全由数据决定：两台设备各自去重时得选出同一个幸存者，
+     * 否则 A 删掉 B 留的、B 删掉 A 留的，来回拉锯永远不收敛。
+     * 所以按 (createdAt, key) 排序取第一条 —— 确定性的，跟谁先跑无关。
+     */
+    dedupeBmks(tol = 0.05) {
+      const groups = new Map();
+      for (const k in this.d.bmks) {
+        const m = this.d.bmks[k];
+        if (!m || m.deleted || !m.bid || !m.cid) continue;
+        const g = m.bid + '|' + m.cid;
+        if (!groups.has(g)) groups.set(g, []);
+        groups.get(g).push({ k, m });
+      }
+
+      let n = 0;
+      for (const list of groups.values()) {
+        if (list.length < 2) continue;
+        list.sort((a, b) =>
+          ((a.m.createdAt || 0) - (b.m.createdAt || 0)) || (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
+
+        const kept = [];
+        for (const { m } of list) {
+          const dup = kept.find((x) => Math.abs((x.cpct || 0) - (m.cpct || 0)) <= tol);
+          if (!dup) { kept.push(m); continue; }
+          // 被丢掉那条身上有幸存者缺的信息，顺手补过去，别白丢
+          if (!dup.title && m.title) dup.title = m.title;
+          if (!dup.anchor && m.anchor) dup.anchor = m.anchor;
+          m.deleted = true; m.updatedAt = now();
+          n++;
+        }
+      }
+      if (n) this.save();
+      return n;
+    },
+
     addBmk(pos) {
       const key = pos.bid + '|' + pos.cid + '-' + now();
       const m = Object.assign({ key, createdAt: now(), updatedAt: now() }, pos);
@@ -509,6 +553,9 @@
       });
       // 老版本的云端数据里进度还塞在书记录里，合并完顺手搬到 prog 表
       DB.migrateLegacyProgress();
+      // 两台设备各自在同一位置加过书签的话，key 不同、合并后会并排留下来，
+      // 这里收掉。选谁留是确定性的，所以各设备算出来的结果一致
+      DB.dedupeBmks();
       DB.d.tagPool = [...new Set([...DB.d.tagPool, ...(remote.tagPool || [])])];
       if (remote.site && !Object.keys(DB.d.site).length) DB.d.site = remote.site;
     },
