@@ -43,6 +43,7 @@ DONE_TID = '999001'     # 用来验「已完结且读完的书不算在读」
 # chapter_index.html 夹具里去重后的章节数。写死是故意的 ——
 # 夹具一变这条就会红，提醒去核对去重逻辑（原始链接有 138 条，含手机/桌面两份目录）
 CHAP_TOTAL = 46
+UPD_TID = '999002'      # 用来验「后台自己查新章」：种子里故意只记 3 章
 # thread.html 里那 6 章（按出现顺序）
 PIDS = ['15749637', '15771234', '15776844', '15781781', '15787165', '15794090']
 PID_PROGRESS = PIDS[0]  # 进度指向第一章 —— post.html 夹具正好是这一章，跳转落地能验
@@ -122,6 +123,11 @@ SEED = {
             'tags': ['追更中', '甜文'], 'review': '总评测试', 'updatedAt': 1,
             'chapTotal': 46, 'done': False, 'chapSeenAt': 1700000000000,
         },
+        # 章节数过时（只记了 3 章）且很久没查过 → 后台应该去抓一次目录页更新它
+        UPD_TID: {
+            'id': UPD_TID, 'title': '待查新章的书', 'url': '', 'tags': [], 'review': '',
+            'updatedAt': 1, 'chapTotal': 3, 'done': False, 'chapCheckedAt': 1,
+        },
         # 已完结 + 读到最后一章 + 那一章也读完了 → 不该算「在读」
         DONE_TID: {
             'id': DONE_TID, 'title': '读完的书', 'url': '', 'tags': [], 'review': '',
@@ -141,6 +147,11 @@ SEED = {
             # updatedAt 特意给大，用来验「最近读的排最前」
             'pct': 0.4, 'cpct': 0.55, 'anchor': '', 'ts': 1, 'updatedAt': 5000,
         },
+        UPD_TID: {
+            'bid': UPD_TID, 'cid': PID_PROGRESS, 'title': '第一章',
+            'url': f'/posts/{PID_PROGRESS}', 'no': 1,
+            'pct': 0.2, 'cpct': 0.2, 'anchor': '', 'ts': 1, 'updatedAt': 2000,
+        },
         DONE_TID: {
             'bid': DONE_TID, 'cid': '9001', 'title': '5 最终章',
             'url': '/posts/9001', 'no': 5,
@@ -156,17 +167,16 @@ SEED = {
         f'{BOGUS_TID}|{BOGUS_TID}': {'bid': BOGUS_TID, 'cid': BOGUS_TID, 'title': '',
                                      'mark': 'good', 'note': '', 'url': '', 'updatedAt': 1},
     },
-    # 两个手动书签，都不带名字（书签就是个位置，不需要命名）
+    # 两个手动书签。书签是**章级**的：不起名字、也不记章内位置，
+    # 认出「是哪一章」就够了
     'bmks': {
         f'{TID}|{PIDS[1]}-1': {
             'key': f'{TID}|{PIDS[1]}-1', 'bid': TID, 'cid': PIDS[1], 'title': '第二章',
-            'url': f'/posts/{PIDS[1]}', 'pct': 0.4, 'cpct': 0.6, 'anchor': '',
-            'createdAt': 2, 'updatedAt': 2,
+            'url': f'/posts/{PIDS[1]}', 'createdAt': 2, 'updatedAt': 2,
         },
         f'{TID}|{PIDS[3]}-2': {
             'key': f'{TID}|{PIDS[3]}-2', 'bid': TID, 'cid': PIDS[3], 'title': '第四章',
-            'url': f'/posts/{PIDS[3]}', 'pct': 0.7, 'cpct': 0.2, 'anchor': '',
-            'createdAt': 1, 'updatedAt': 1,
+            'url': f'/posts/{PIDS[3]}', 'createdAt': 1, 'updatedAt': 1,
         },
     },
     'tagPool': ['追更中', '甜文', '弃坑', '列表验证'],
@@ -180,6 +190,8 @@ SEED = {
     'mig1': True,
     'mig2': True,
     'mig3': True,
+    'mig4': True,
+    'mig5': True,
 }
 
 # 各列表页的样本书也塞进种子，统一打「列表验证」标签
@@ -243,6 +255,12 @@ CHECK_JS = r"""
       bookItemBadge: n('article[class*="item"][class*="id__TID__"] [data-fw-badge]'),
       markBtns: n('[data-fw-mark]'),
       bmkBtns: n('[data-fw-bmk]'),
+      // 章节内只留书签了 —— 备注的入口必须一个都不剩
+      noteBtns: n('[data-fw-note]'),
+      // 书名后那个「▶ 读到某章」要能点着跳回去
+      jumpPills: n('[data-fw-jump]'),
+      // 书签钮只留一个图标：标了的是亮的（带 data-fw-bmkon），没标的是灰的
+      bmkOn: n('[data-fw-bmk][data-fw-bmkon]'),
       bmkSeeded: liveBmks().length,
       // 同一章里还活着的书签（验跨设备去重）
       dupLive: liveBmks().filter(function (m) { return m.cid === '__PID_BMK__'; }).length,
@@ -323,14 +341,22 @@ CHECK_JS = r"""
       if (progTab) progTab.click();
       r.progText = sr ? ((sr.querySelector('[data-list]') || {}).textContent || '') : '';
       r.progSub = sr ? ((sr.querySelector('.sheet header .sub') || {}).textContent || '') : '';
-      // 排序验在「评价」tab：默认的「书签」tab 只有一本书有书签，看不出先后。
+      // 排序验在「书评」tab：默认的「书签」tab 只有一本书有书签，看不出先后。
       // 取书 id 而不是书名 —— 书名会被页面上的真实标题覆盖（noteBook 会更新它）
       var rate = sr ? sr.querySelector('[data-tab="rate"]') : null;
       if (rate) rate.click();
       r.allListOrder = sr
         ? [].map.call(sr.querySelectorAll('.book'),
-            function (e) { return e.getAttribute('data-bid'); }).slice(0, 3)
+            function (e) { return e.getAttribute('data-bid'); })
         : [];
+      // 写好的书评是纯文本，不是一直摆着的输入框；铅笔点开才有输入框
+      r.rateRvText = sr ? ((sr.querySelector('.book .rv') || {}).textContent || '') : '';
+      r.rateTextareas = sr ? sr.querySelectorAll('.rvedit').length : 0;
+      r.ratePens = sr ? sr.querySelectorAll('[data-pen]').length : 0;
+      var pen = sr ? sr.querySelector('[data-pen]') : null;
+      if (pen) pen.click();
+      r.penBoxes = sr ? sr.querySelectorAll('.rvbox .rvedit').length : 0;
+      r.penTags = sr ? sr.querySelectorAll('.rvbox [data-btag]').length : 0;
       var cls = h && h.shadowRoot ? h.shadowRoot.querySelector('.cls') : null;
       if (cls) cls.click();   // 关回去，别影响后面的断言
     })();
@@ -360,6 +386,59 @@ CHECK_JS = r"""
         location.href = '/__relay__';
         return;
       }
+    }
+
+    /* 模式零：查新章是**手动**的。
+     * 先确认没人点的时候章节数一动不动（不后台偷跑），
+     * 再点「🔄 查一下有没有新章」，看过时的章节数有没有被更新。 */
+    if (location.search.indexOf('fwtest=upd') >= 0) {
+      r.updBefore = ((db().books || {})['__UPD__'] || {}).chapTotal || null;
+      var h2 = document.getElementById('__fw_marks__');
+      var sr2 = h2 && h2.shadowRoot;
+      var nav2 = document.querySelector('[data-fw-nav] [data-fw-open]');
+      if (nav2) nav2.click();
+      var pt = sr2 ? sr2.querySelector('[data-tab="prog"]') : null;
+      if (pt) pt.click();
+      var btn2 = sr2 ? sr2.querySelector('[data-act="chkupd"]') : null;
+      r.updBtn = !!btn2;
+      if (btn2) btn2.click();
+      setTimeout(function () {
+        var bk = (db().books || {})['__UPD__'] || {};
+        r.updTotal = bk.chapTotal || null;
+        r.updCheckedAt = bk.chapCheckedAt || null;
+        finish();
+      }, 5000);
+      return;
+    }
+
+    /* 模式四：跨标签页写入不许互相冲掉。
+     * 直接改存储，假装「另一个标签页刚把进度记到了别的一章」，
+     * 然后让本页也存一次 —— 整包覆盖的写法会把它冲掉，
+     * 逐条合并的写法会留下时间戳更新的那条。
+     * 这正是「详情页点进章节读完返回，进度没了」那个 bug 的机制。 */
+    if (location.search.indexOf('fwtest=crosstab') >= 0) {
+      var d0 = db();
+      d0.prog = d0.prog || {};
+      d0.prog['__TID__'] = {
+        bid: '__TID__', cid: '__PID_CLICK__', title: '另一个标签页记的',
+        url: '/posts/__PID_CLICK__', pct: 0.9, cpct: 0.9, anchor: '',
+        ts: 9, updatedAt: 9e12,
+      };
+      d0.savedAt = 9e12;
+      localStorage.setItem('__fwm__db', JSON.stringify(d0));
+      // 触发本页的一次写入：给某一章打个标记就会存
+      var mk = document.querySelector('[data-fw-mark="ok"][data-fw-pid="__PID_CLICK__"]');
+      r.crossTriggered = !!mk;
+      if (mk) mk.click();
+      setTimeout(function () {
+        var pg = (db().prog || {})['__TID__'] || {};
+        r.crossCid = pg.cid || null;
+        r.crossTitle = pg.title || '';
+        // 本页自己那次写入也得真的落下来，不能为了保别人的就把自己丢了
+        r.crossOwnWrite = !!((db().chaps || {})['__TID__|__PID_CLICK__'] || {}).mark;
+        finish();
+      }, 900);
+      return;
     }
 
     /* 模式三：滚到别的一章，看进度有没有及时换过去并落盘。
@@ -392,6 +471,7 @@ CHECK_JS = r"""
     setTimeout(function () {
       r.bmkAfterAdd = liveBmks().length;
       r.barAfterAdd = barOf('__PID_CLICK__');
+      r.bmkOnAfterAdd = n('[data-fw-bmk][data-fw-bmkon]');
       document.querySelector('[data-fw-bmk="__PID_CLICK__"]').click();
       setTimeout(function () {
         r.bmkAfterToggle = liveBmks().length;
@@ -409,7 +489,8 @@ CHECK_JS = r"""
   }
 })();
 """.replace('__TID__', TID).replace('__BOGUS__', BOGUS_TID) \
-   .replace('__PID_BMK__', PIDS[1]).replace('__PID_CLICK__', PID_CLICK)
+   .replace('__PID_BMK__', PIDS[1]).replace('__PID_CLICK__', PID_CLICK) \
+   .replace('__UPD__', UPD_TID)
 
 
 # ?fwtest=landing 时预先塞进 sessionStorage 的「定位接力棒」，
@@ -424,13 +505,15 @@ def inject_html(html, query=''):
     # 全程用拼接，不用 % 格式化 —— 注入的内容里要是带个 % 就会被当成格式符炸掉
     data = SEED
     if 'fwtest=dupbmk' in query:
-        # 模拟两台设备各自在「同一个位置」加过书签：key 不同、章内位置只差 2%。
-        # 去重应该只留一条，而且留的必须是 createdAt 更早的那条（确定性）
+        # 模拟两台设备各自给「同一章」加过书签：key 不同（key 带时间戳）。
+        # 书签是章级的，同章就算重复 —— 去重应该只留一条，
+        # 而且留的必须是 createdAt 更早的那条（确定性，不然两台设备来回删）
         data = json.loads(json.dumps(SEED))
         data.pop('mig3', None)
+        data.pop('mig5', None)
         base = dict(SEED['bmks'][f'{TID}|{PIDS[1]}-1'])
         later = dict(base)
-        later.update({'key': f'{TID}|{PIDS[1]}-999', 'cpct': 0.62,
+        later.update({'key': f'{TID}|{PIDS[1]}-999',
                       'createdAt': 9999, 'updatedAt': 9999})
         data['bmks'][f'{TID}|{PIDS[1]}-999'] = later
 
@@ -656,6 +739,14 @@ def static_checks():
     checks.append(('同步的表清单是白名单，且不含 cfg',
                    bool(coll) and 'cfg' not in coll and
                    set(coll) == {'books', 'chaps', 'bmks', 'prog'}))
+    # 写回存储前必须逐条合并。整包覆盖会让「别的标签页/页面缓存里那份」
+    # 把刚记的进度冲掉 —— 这是实打实出过的 bug，钉住它
+    flushb = code_only(body_of(r'_flush\(\)\s*\{.*?\n    \},'))
+    checks.append(('写回存储前先逐条合并（不整包覆盖）',
+                   bool(flushb) and 'mergeStored' in flushb and 'GMx.set' in flushb))
+    # 查新章只能手动触发，不许挂定时器后台偷跑
+    checks.append(('查新章没有后台定时器',
+                   not re.search(r'setTimeout\([^;]{0,80}checkUpdates', s)))
 
     print('=== 静态检查（源码级，不开浏览器）===')
     ok = 0
@@ -700,11 +791,22 @@ def main():
             ('介绍页也能学到连载状态', lambda r: r.get('learnedDone') is False),
             ('读完的书归到「读完了」',  lambda r: '读完了' in r.get('progText', '')
              and '✓ 读完' in r.get('progText', '')),
-            ('在读只算 1 本、读完 1 本', lambda r: '1 本在读' in r.get('progSub', '')
+            # 种子里 3 本有进度：TID 和 UPD_TID 在读、DONE_TID 已读完
+            ('在读算 2 本、读完 1 本', lambda r: '2 本在读' in r.get('progSub', '')
              and '1 本读完' in r.get('progSub', '')),
+            ('进度 tab 里书名后也有铅笔', lambda r: '✏️' in r.get('progText', '')),
             ('最近读的书排在列表最前', lambda r: (r.get('allListOrder') or [None])[0] == TID),
-            ('评价 tab 列出了多本书（排序才有意义）',
+            ('书评 tab 列出了多本书（排序才有意义）',
              lambda r: len(r.get('allListOrder') or []) >= 2),
+            # 只有进度、没打标签也没写书评的书，不该挤进书评 tab
+            ('没评过的书不出现在书评 tab',
+             lambda r: UPD_TID not in (r.get('allListOrder') or [])),
+            ('写好的书评显示成文本',   lambda r: '总评测试' in r.get('rateRvText', '')),
+            ('没点铅笔时不摆输入框',   lambda r: r.get('rateTextareas') == 0),
+            ('每本书名后都有铅笔',     lambda r: (r.get('ratePens') or 0) >= 1),
+            ('点铅笔就展开书评框 + 标签',
+             lambda r: r.get('penBoxes') == 1 and (r.get('penTags') or 0) >= 1),
+            ('书名后的进度条能点着跳', lambda r: (r.get('jumpPills') or 0) >= 1),
             ('页面链接没被挡住',       lambda r: not r['blockedLinks']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
@@ -743,10 +845,15 @@ def main():
             (f'每章都有书签钮',        lambda r: r['bmkBtns'] == len(PIDS)),
             ('已标章节高亮正确',       lambda r: '精彩' in r['barsText'] and '跳过' in r['barsText']),
             ('标出了「读到这里」',     lambda r: '读到这里' in r['barsText']),
-            ('有书签的章节显示「🔖 书签 1」', lambda r: '🔖 书签 1' in r['barMarked']),
-            ('没书签的章节只显示「🔖 书签」', lambda r: '🔖 书签' in r['barPlain'] and '书签 1' not in r['barPlain']),
+            # 书签钮只留图标，不写字（标了是亮的、没标是灰的）
+            ('书签钮只有图标、没有文字', lambda r: '🔖' in r['barsText']
+             and '书签' not in r['barsText']),
+            ('只有加过书签的那两章是亮的', lambda r: r['bmkOn'] == 2),
+            # 章节内只留书签：备注的入口（会弹面板要打字的那个钮）全撤了
+            ('章节内没有「备注」按钮了', lambda r: r['noteBtns'] == 0
+             and '备注' not in r['barsText']),
             ('点 🔖 真能加上书签',     lambda r: r['clickTested'] and r['bmkAfterAdd'] == r['bmkSeeded'] + 1),
-            ('加完立刻变「🔖 书签 1」', lambda r: '🔖 书签 1' in r['barAfterAdd']),
+            ('加完那一章的图标立刻亮起来', lambda r: r.get('bmkOnAfterAdd') == 3),
             ('同位置再点 = 取消',      lambda r: r['bmkAfterToggle'] == r['bmkSeeded']),
             # 「回去吗」确认栏横在底部时，不许把下面网站自己的链接挡死
             ('确认栏没挡住页面链接',   lambda r: not r['blockedLinks']),
@@ -775,6 +882,21 @@ def main():
             ('存储盖了 savedAt 时间戳（关页面兜底靠它选新的那份）',
              lambda r: (r.get('savedAt') or 0) > 0),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}?fwtest=upd', '手动查新章（不用点开每本书）', [
+            ('没点之前不后台偷查',   lambda r: r.get('updBefore') == 3),
+            ('进度 tab 里有「查新章」按钮', lambda r: r.get('updBtn') is True),
+            ('点了之后过时的章节数被更新了', lambda r: r.get('updTotal') == CHAP_TOTAL),
+            ('记下了这次查过的时间', lambda r: (r.get('updCheckedAt') or 0) > 1),
+            ('没有 JS 报错',        lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}?fwtest=crosstab', '两个标签页同时写 → 不许互相冲掉', [
+            ('确实触发了本页的写入', lambda r: r.get('crossTriggered') is True),
+            ('另一个标签页刚记的进度还在',
+             lambda r: r.get('crossCid') == PID_CLICK
+             and r.get('crossTitle') == '另一个标签页记的'),
+            ('本页自己那次写入也落盘了', lambda r: r.get('crossOwnWrite') is True),
+            ('没有 JS 报错',        lambda r: not r['jsErrors']),
         ]),
         (f'/posts/{PID_PROGRESS}?fwtest=landing', '跳转落地 → 自动复位到记录位置', [
             ('落地页认出了章节',       lambda r: r['bars'] == 1),

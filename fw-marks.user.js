@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.9.0
-// @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
+// @version      1.11.0
+// @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
 // @match        *://*.xn--pxtr7m.com/*
@@ -118,8 +118,8 @@
 
   // ==========================================================================
   // 2. 数据层
-  //    books[bid]            书：标签、总评、阅读进度
-  //    chaps[bid|cid]        章：标签、备注
+  //    books[bid]            书：标签、书评
+  //    chaps[bid|cid]        章：标签（note 是老数据，只读不写了）
   //    site                  学到的本站 URL 规律
   //    删除一律软删（deleted:true + updatedAt），否则同步会把删掉的复活
   // ==========================================================================
@@ -171,7 +171,7 @@
      */
     migrate() {
       const steps = [['mig1', '_mig1'], ['mig2', '_mig2'], ['mig3', '_mig3'],
-                     ['mig4', '_mig4']];
+                     ['mig4', '_mig4'], ['mig5', '_mig5']];
       let n = 0, ran = false;
       for (const [flag, fn] of steps) {
         if (this.d[flag]) continue;
@@ -191,6 +191,15 @@
 
     // v1.5.1：把历史上已经同步出来的重复书签收掉
     _mig3() { return this.dedupeBmks(); },
+
+    /*
+     * v1.11：书签改成「章级」——只记是哪一章，不记章内位置。
+     * 所以去重规则从「同章且位置相差 ≤5%」放宽成「同章就算重复」，
+     * 老数据里同一章的多条书签要按新规则再收一次。
+     * 老记录身上那几个位置字段（cpct/anchor）留着不删 —— 删了是不可逆的，
+     * 而且反正不再用它们了（跳转只认章，见 data-bmkgo 的处理）。
+     */
+    _mig5() { return this.dedupeBmks(); },
 
     /*
      * v1.8：同步从「一个大文件」改成「一个文件夹、一表一文件」。
@@ -262,13 +271,70 @@
       return n;
     },
 
-    _t: null,
-    save() { // 防抖，连点标签不会反复序列化整包
-      this.d.savedAt = now();   // GMx.get 靠它判断 GM 和 localStorage 镜像哪份更新
-      clearTimeout(this._t);
-      this._t = setTimeout(() => GMx.set('db', this.d), 250);
+    /*
+     * ---- 跨页面 / 跨标签页的写入冲突 ----
+     * 每个页面都有自己那一份内存里的 DB.d。原来写回去是**整包覆盖**，
+     * 于是谁最后写谁赢，另一个页面刚记下的东西会被整包冲掉。真实症状：
+     *   · 在详情页点进某章读完 → 返回详情页（Safari 的「返回」是页面缓存，
+     *     恢复出来的还是那份**老**内存数据）→ 它一存，刚记的进度就没了
+     *   · 从列表页再点进去，看到的是列表页当初加载时的旧进度
+     * 所以：写之前先把存储里那份读出来，逐条比 updatedAt 合并，再写。
+     * 读用同步的 localStorage 镜像 —— GM 的读是异步的，
+     * 而「页面正在被关掉」那一刻等不起异步。
+     */
+    stored() {
+      try {
+        const raw = localStorage.getItem('__fwm__db');
+        return raw ? JSON.parse(raw) : null;
+      } catch (e) { return null; }
     },
-    saveNow() { this.d.savedAt = now(); clearTimeout(this._t); return GMx.set('db', this.d); },
+
+    /*
+     * 把存储里那份合并进内存里这份。逐条比 updatedAt 取新的 ——
+     * 和云同步用的是同一套规则，所以行为一致、也一样收敛。
+     * 返回 true = 内存里的数据真的变了，需要重绘。
+     */
+    mergeStored(o) {
+      if (!o || typeof o !== 'object') return false;
+      let changed = false;
+      for (const k of COLLECTIONS) {
+        const src = o[k] || {}, dst = this.d[k] || (this.d[k] = {});
+        for (const id in src) {
+          const r = src[id], l = dst[id];
+          if (!r || typeof r !== 'object') continue;
+          if (!l || (r.updatedAt || 0) > (l.updatedAt || 0)) { dst[id] = r; changed = true; }
+        }
+      }
+      const pool = [...new Set([...(this.d.tagPool || []), ...(o.tagPool || [])])];
+      if (pool.length !== (this.d.tagPool || []).length) { this.d.tagPool = pool; changed = true; }
+
+      /*
+       * 这几项不是「一条条的记录」，没有自己的 updatedAt，只能整块取新的那份。
+       * 用 savedAt 判谁新：写入前会先把自己的 savedAt 盖成现在，
+       * 所以**保存时**永远是内存这份赢（不会把用户刚改的设置冲掉），
+       * 只有从缓存恢复 / 别的标签页写过 这两种「主动去拉」的场合才会采纳存储那份。
+       */
+      if ((o.savedAt || 0) > (this.d.savedAt || 0)) {
+        this.d.cfg = Object.assign({}, this.d.cfg, o.cfg || {});
+        if (o.status) this.d.status = o.status;
+        this.d.lastSync = Math.max(this.d.lastSync || 0, o.lastSync || 0);
+        this.d.lastCheck = Math.max(this.d.lastCheck || 0, o.lastCheck || 0);
+        if (o.site && Object.keys(o.site).length) this.d.site = o.site;
+      }
+      return changed;
+    },
+
+    _t: null,
+    _flush() {
+      this.d.savedAt = now();        // GMx.get 靠它判断 GM 和 localStorage 镜像哪份更新
+      this.mergeStored(this.stored()); // 别整包盖掉别的页面刚写的
+      return GMx.set('db', this.d);
+    },
+    save() { // 防抖，连点标签不会反复序列化整包
+      clearTimeout(this._t);
+      this._t = setTimeout(() => this._flush(), 250);
+    },
+    saveNow() { clearTimeout(this._t); return this._flush(); },
 
     book(bid, create) {
       if (!bid) return null;
@@ -280,14 +346,14 @@
     /*
      * ---- 阅读进度：单独一张表，不再塞在书记录里 ----
      * 原因：读书时进度一直在刷新，塞在书记录里会让 book.updatedAt 一直变。
-     * 而合并是「整条记录取最新」，于是另一台设备刚加的标签/总评会被
+     * 而合并是「整条记录取最新」，于是另一台设备刚加的标签/书评会被
      * 进度带起来的那次更新整条盖掉。拆开之后两者互不干扰。
      */
     prog(bid) {
       if (!bid) return null;
       const p = this.d.prog[bid];
       // 只看进度自己那条记录。以前还会因为「书记录被删」就不显示，
-      // 但进度 / 书签 / 评价 是互相独立的三件事 —— 清掉评价不该让进度消失
+      // 但进度 / 书签 / 书评 是互相独立的三件事 —— 清掉书评不该让进度消失
       return p && !p.deleted ? p : null;
     },
 
@@ -346,8 +412,9 @@
     },
 
     // ---- 书签 ----
-    // 和「阅读进度」的区别：进度每本书只有一条、会被自动覆盖；
-    // 书签是手动的、一本书可以有很多条、只有你自己能删。
+    // 和「阅读进度」的区别：进度每本书只有一条、记到章内位置、会被自动覆盖；
+    // 书签是手动的、章级的（一章一条，只记是哪章）、一本书可以有很多条、
+    // 只有你自己能删。
     bmksOf(bid) {
       return Object.values(this.d.bmks)
         .filter((m) => m.bid === bid && !m.deleted)
@@ -356,21 +423,25 @@
     bmksOfChap(bid, cid) {
       return this.bmksOf(bid).filter((m) => m.cid === cid);
     },
-    // 同一章里位置几乎一样的书签（防手抖点重复）
-    bmkNear(bid, cid, cpct, tol = 0.05) {
-      return this.bmksOfChap(bid, cid).find((m) => Math.abs((m.cpct || 0) - (cpct || 0)) <= tol) || null;
-    },
+    /*
+     * 这一章的书签。书签是**章级**的：一章要么标了要么没标 ——
+     * 「这章以后要回来看」不需要精确到第几段，那是阅读进度的活。
+     * 所以同一章最多只有一条，再点一次就是取消。
+     */
+    bmkOfChap(bid, cid) { return this.bmksOfChap(bid, cid)[0] || null; },
     /*
      * 跨设备去重。
      * 书签的 key 带时间戳（书|章-1758…），所以同一个位置在两台设备上各加一次，
      * key 不一样 → 合并时两条都留下来 → 冒出重复书签。
-     * 本地新建时那个 ±5% 的 bmkNear 只在「建的那一刻」生效，管不到合并。
+     * 本地新建时那个「同章就算重复」的判断只在建的那一刻生效，管不到合并。
      *
      * 留哪一条必须完全由数据决定：两台设备各自去重时得选出同一个幸存者，
      * 否则 A 删掉 B 留的、B 删掉 A 留的，来回拉锯永远不收敛。
      * 所以按 (createdAt, key) 排序取第一条 —— 确定性的，跟谁先跑无关。
+     *
+     * v1.11 起书签是章级的，所以「同书同章」就是重复，不再比章内位置。
      */
-    dedupeBmks(tol = 0.05) {
+    dedupeBmks() {
       const groups = new Map();
       for (const k in this.d.bmks) {
         const m = this.d.bmks[k];
@@ -386,13 +457,10 @@
         list.sort((a, b) =>
           ((a.m.createdAt || 0) - (b.m.createdAt || 0)) || (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
 
-        const kept = [];
-        for (const { m } of list) {
-          const dup = kept.find((x) => Math.abs((x.cpct || 0) - (m.cpct || 0)) <= tol);
-          if (!dup) { kept.push(m); continue; }
+        const keep = list[0].m;
+        for (const { m } of list.slice(1)) {
           // 被丢掉那条身上有幸存者缺的信息，顺手补过去，别白丢
-          if (!dup.title && m.title) dup.title = m.title;
-          if (!dup.anchor && m.anchor) dup.anchor = m.anchor;
+          if (!keep.title && m.title) keep.title = m.title;
           m.deleted = true; m.updatedAt = now();
           n++;
         }
@@ -766,7 +834,15 @@
       postBlock:   '[id^="post"]',                                    // div#post{pid}
       chapTitle:   '.main-text .text-center strong a[href*="/posts/"]',
       catalogWrap: '.hidden-sm.hidden-md.hidden-lg, .hidden-xs.table-hover',
-      catalogLink: 'a[href*="/posts/"]',
+      /*
+       * 只认真正的目录项：手机版是 btn-block 按钮、桌面版在 table 里。
+       * 不能笼统地用 a[href*="/posts/"] —— 书籍介绍页的移动端容器里还塞了
+       * 「总字数/阅读数」信息栏，那里也有一个 /posts/ 链接，会让章节数多算一条
+       * （实测介绍页 47、目录列表页 46，差的就是它）。
+       */
+      catalogLink: 'a[class*="btn-block"][href*="/posts/"], table a[href*="/posts/"]',
+      // 「有更新」不看站点自己那个 newchapter-badge —— 实际用起来经常不准。
+      // 章节数由脚本自己数目录得出（点「查新章」时会抓一次目录页，见 checkUpdates）
       bookCrumb:   (tid) => 'a[href$="/threads/' + tid + '/profile"]', // 面包屑里的书名
     },
     bodyOf: (pid) => '#full' + pid,
@@ -1026,23 +1102,22 @@
     (Page.native && cid ? location.origin + '/posts/' + cid : location.href);
 
   /*
-   * 记一个「位置」—— 阅读进度和书签共用同一个结构，所以两边定位行为完全一致。
+   * 记一个「阅读位置」。只有阅读进度用它 —— 书签是章级的，用 chapPos。
    *   cid    哪一章
    *   cpct   这一章内部读到百分之几（换字号/换设备都还算得准）
    *   anchor 视口顶部那句话的前 40 字，回来时优先靠它精准复位
    *   pct    整页百分比，最后的兜底
-   * atTop=true 表示「从这一章开头」，用于给不在视口里的章节加书签。
    * url 存 /posts/{pid} 而不是当前 ?page=N —— 作者一更新，页码就会漂，
    * 章节固定链接才是稳的。
    */
-  function capturePos(cid, atTop) {
+  function capturePos(cid) {
     const pid = cid || Page.cid;
     const ch = Page.chapters.find((c) => c.pid === pid);
     const max = document.documentElement.scrollHeight - window.innerHeight;
     const pct = max > 0 ? Math.min(1, Math.max(0, window.scrollY / max)) : 0;
 
     let cpct = 0, anchor = '';
-    if (!atTop && ch) {
+    if (ch) {
       const r = ch.el.getBoundingClientRect();
       if (r.height > 0) cpct = Math.min(1, Math.max(0, (80 - r.top) / r.height));
     }
@@ -1050,8 +1125,7 @@
     if (scope) {
       for (const el of scope.children) {
         const r = el.getBoundingClientRect();
-        // atTop 时不看视口，直接取这一章第一段有字的
-        if (atTop || (r.bottom > 60 && r.top < window.innerHeight * 0.5)) {
+        if (r.bottom > 60 && r.top < window.innerHeight * 0.5) {
           const t = (el.textContent || '').replace(/\s+/g, '').trim();
           if (t.length >= 8) { anchor = t.slice(0, 40); break; }
         }
@@ -1063,16 +1137,17 @@
     const stored = (DB.chap(Page.bid, pid, false) || {}).title;
     const title = (stored || '').length > (onPage || '').length ? stored : onPage;
 
-    // 章节号：站点的章节标题就是以序号开头的（「7」或「7 章节名」），
-    // 取开头那个整数即可。解析不出来就不写，别猜
-    const noM = /^\s*(\d+)/.exec(title || '');
+    // 章节序号（no）不在这里算：正文页上算不出「全书第几章」，
+    // 而标题里的序号又可能是中文数字。它由逛目录时的位置来学（learnBookMeta）。
+    // 已经学到的值要保留 —— 同一章重新记进度时别把它抹掉
+    const keep = (DB.prog(Page.bid) || {});
     const pos = {
       bid: Page.bid, cid: pid,
       title,
       url: chapUrl(pid),
       pct, cpct, anchor, ts: now(),
     };
-    if (noM) pos.no = parseInt(noM[1], 10);
+    if (keep.cid === pid && keep.no) pos.no = keep.no;
     return pos;
   }
 
@@ -1083,7 +1158,7 @@
   const Progress = {
     capture() {
       if (Page.type !== 'chapter' || !Page.bid || !Page.cid) return null;
-      return capturePos(Page.cid, false);
+      return capturePos(Page.cid);
     },
     record() {
       const p = this.capture();
@@ -1195,17 +1270,30 @@
   }
 
   /*
-   * 加 / 取消书签。
-   * 同一章里位置差不多（±5%）的地方再点一次 = 取消，
-   * 这样手抖连点不会攒出一堆几乎一样的书签。
-   * atTop：给不在视口里的那一章加书签时，从章首算。
+   * 书签的「位置」= 就是哪一章，不记章内进度。
+   * 书签要回答的是「这一章以后要回来看」，不是「我读到这儿了」——
+   * 后者是阅读进度的活，而且它会自动更新，两件事别混。
+   * 所以这里只要章 id + 章节名 + 章节固定链接。
    */
-  function toggleBmk(cid, atTop) {
-    if (Page.type !== 'chapter' || !Page.bid) { toast('这一页没法加书签喵'); return false; }
-    const pos = capturePos(cid, atTop);
-    if (!pos.cid) { toast('没认出是哪一章喵'); return false; }
+  function chapPos(cid) {
+    const pid = cid || Page.cid;
+    if (!pid) return null;
+    const ch = Page.chapters.find((c) => c.pid === pid);
+    // 章节名优先用「更全的那个」：正文页标题区只有章节号，
+    // 而逛目录时学下来的名字带章节名，那个才认得出是哪一章
+    const onPage = ch ? ch.title : Page.title;
+    const stored = (DB.chap(Page.bid, pid, false) || {}).title;
+    const title = (stored || '').length > (onPage || '').length ? stored : onPage;
+    return { bid: Page.bid, cid: pid, title, url: chapUrl(pid), ts: now() };
+  }
 
-    const dup = DB.bmkNear(Page.bid, pos.cid, pos.cpct);
+  // 加 / 取消书签。一章最多一条，所以在同一章再点一次就是取消
+  function toggleBmk(cid) {
+    if (Page.type !== 'chapter' || !Page.bid) { toast('这一页没法加书签喵'); return false; }
+    const pos = chapPos(cid);
+    if (!pos) { toast('没认出是哪一章喵'); return false; }
+
+    const dup = DB.bmkOfChap(Page.bid, pos.cid);
     if (dup) {
       dup.deleted = true;
       DB.touch(dup);
@@ -1213,7 +1301,7 @@
     } else {
       Page.noteBook(Page.bid, Page.bookTitle, FW.catalogUrl(Page.bid), true);
       DB.addBmk(pos);
-      toast(`🔖 已加书签：${pos.title || '本章'} ${Math.round((pos.cpct || 0) * 100)}%`);
+      toast(`🔖 已加书签：${pos.title || '本章'}`);
     }
     paintAll();
     if (sheet.classList.contains('on')) render();
@@ -1289,13 +1377,6 @@
   .row { margin-bottom: 16px; }
   .row > label { display: block; font-size: 12px; color: #8e8e93; margin-bottom: 7px; }
 
-  .marks { display: flex; gap: 8px; }
-  .marks button {
-    flex: 1; padding: 13px 0; border-radius: 10px; border: 1.5px solid #e2e2e4;
-    background: #fff; color: #444; font-size: 15px; font-weight: 500;
-  }
-  .marks button.on { color: #fff; border-color: transparent; }
-
   textarea, input[type=text], input[type=password] {
     width: 100%; border: 1.5px solid #e2e2e4; border-radius: 10px;
     padding: 10px 11px; font-size: 14px; background: #fafafa; color: #1c1c1e;
@@ -1324,6 +1405,12 @@
   .book .meta { font-size: 11.5px; color: #8e8e93; line-height: 1.7; }
   .book .rv { font-size: 12.5px; color: #555; margin-top: 5px; line-height: 1.5;
     background: #fafafa; padding: 6px 8px; border-radius: 7px; }
+  /* 书名后面那支铅笔：点开才展开编辑块，收着的时候一个字都不占 */
+  .pen { cursor: pointer; margin-left: 5px; font-size: 12px; opacity: .75;
+    vertical-align: middle; }
+  .rvbox { margin-top: 8px; border-top: 1px dashed #e5e5e7; padding-top: 8px; }
+  .rvbox .tags { margin-bottom: 2px; }
+  .rvbox .t { font-size: 12px; padding: 4px 9px; }
   .chaplist { margin-top: 8px; border-top: 1px dashed #e5e5e7; padding-top: 7px; display: none; }
   .chaplist.on { display: block; }
   .chaplist a {
@@ -1434,20 +1521,15 @@
   }
   const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
+  // 'ctx' = 当前这本书 | 'all' = 我的标记 | 'cfg' = 同步设置
   let view = 'ctx';
-  // 在正文页也想看「这本书」的面板时置位。用独立开关而不是去改 Page.type，
-  // 免得改完之后这一页就再也渲染不出章节面板了
-  let forceBook = false;
   function openSheet(v) { view = v || 'ctx'; render(); mask.classList.add('on'); sheet.classList.add('on'); }
   function closeSheet() {
     mask.classList.remove('on'); sheet.classList.remove('on');
-    forceBook = false;
+    editing = null;    // 下次打开不要还挂着上次那个展开的编辑框
   }
   // 页面上各处入口统一走这里
-  function openView(v) {
-    forceBook = (v === 'book');
-    openSheet(v === 'book' ? 'ctx' : v);
-  }
+  function openView(v) { openSheet(v === 'book' ? 'ctx' : v); }
   mask.onclick = closeSheet;
   $('.cls').onclick = closeSheet;
   function refreshUI() { if (sheet.classList.contains('on')) render(); paintAll(); }
@@ -1456,14 +1538,22 @@
   // ==========================================================================
   // 7. 面板渲染
   // ==========================================================================
+  /*
+   * 正文页也直接渲染「这本书」的面板。
+   * 以前正文页有个专门的章节面板，唯一的用处是给这一章写备注 ——
+   * 备注去掉之后，章节那点事（标记 / 书签）全在正文里内联做完了，
+   * 面板剩下的只有「整本书」这个层面的东西。
+   */
   function render() {
     if (view === 'all') return renderAll();
     if (view === 'cfg') return renderCfg();
-    if (forceBook) return renderBook();
-    if (Page.type === 'chapter') return renderChapter();
-    if (Page.type === 'catalog') return renderBook();
+    if (Page.bid) return renderBook();
     return renderAll();
   }
+
+  // 认得出是哪本书时，各处面板都留一个「这本书」的入口
+  const bookBtn = () =>
+    (Page.bid ? '<button class="btn g" data-go="book">📖 这本书</button>' : '');
 
   function navBtns(extra = '') {
     return `<div class="btns" style="margin-top:18px">
@@ -1481,16 +1571,15 @@
       去这本书的<b>目录页</b>，从「⚙️ 同步设置」里点<b>重新校准</b>，<br>再点一下任意章节链接就能教会本喵。</div>${navBtns()}`;
   }
 
-  // ---- 书签列表（章节面板 / 书籍面板 / 我的标记 三处共用）----
-  // 书签就是个纯位置，不起名字：章节名 + 百分比 + 那句原文，足够认出是哪儿了
-  function bmkListHTML(list, emptyHint, showChap) {
+  // ---- 书签列表（书籍面板 / 我的标记 两处共用）----
+  // 书签不起名字、也不记章内位置：认出「是哪一章」就够了
+  function bmkListHTML(list, emptyHint) {
     if (!list.length) return emptyHint ? `<div class="hint">${esc(emptyHint)}</div>` : '';
     return list.map((m) => `
       <div class="bmk">
         <div class="go" data-bmkgo="${esc(m.key)}">
-          <span class="pill" style="background:#d98b00">${Math.round((m.cpct || 0) * 100)}%</span>
-          ${showChap ? esc(m.title || m.cid) : ''}
-          ${m.anchor ? `<span class="n">${esc(m.anchor.slice(0, 26))}…</span>` : ''}
+          <span class="pill" style="background:#d98b00">🔖</span>
+          ${esc(m.title || m.cid)}
         </div>
         <span class="bx">
           <button class="btn g sm" data-bmkdel="${esc(m.key)}">删</button>
@@ -1498,45 +1587,13 @@
       </div>`).join('');
   }
 
-  // ---- 正文页：给这一章打标签 + 备注 ----
-  function renderChapter() {
-    if (!Page.bid || !Page.cid) return renderUnknown('章节');
-    const c = DB.chap(Page.bid, Page.cid, false);
-    const cur = c ? c.mark : null;
-    sTitle.textContent = Page.title || '本章';
-    sSub.textContent = Page.bookTitle || '';
-    const bms = DB.bmksOfChap(Page.bid, Page.cid);
-    sBody.innerHTML = `
-      <div class="row">
-        <label>书签</label>
-        <button class="btn" data-act="addBmk">🔖 在我现在读到的位置加书签</button>
-        ${bmkListHTML(bms, '本章还没有书签喵', false)}
-      </div>
-      <div class="row">
-        <label>本章评价</label>
-        <div class="marks">
-          ${Object.entries(MARKS).map(([k, m]) =>
-            `<button data-mark="${k}" class="${cur === k ? 'on' : ''}"
-              style="${cur === k ? 'background:' + m.color : ''}">${m.label}</button>`).join('')}
-        </div>
-      </div>
-      <div class="row">
-        <label>备注（可不填）</label>
-        <textarea data-note placeholder="随手写一句…">${esc(c ? c.note : '')}</textarea>
-      </div>
-      <div class="btns">
-        <button class="btn" data-act="saveChap">保存</button>
-        ${cur || (c && c.note) ? '<button class="btn g" data-act="clearChap">清除本章</button>' : ''}
-      </div>
-      ${navBtns('<button class="btn g" data-go="book">📖 这本书</button>')}
-    `;
-  }
-
-  // ---- 目录页：整本书的总评 + 标签 + 继续阅读 ----
+  // ---- 这本书：书评 + 标签 + 继续阅读 + 书签 ----
   function renderBook() {
     if (!Page.bid) return renderUnknown('书籍');
     const b = DB.book(Page.bid, true);
     const pg = DB.prog(Page.bid);
+    // note 已经不能再写了（章节内只留书签），但老数据里存量的备注还得认，
+    // 不然以前写过的东西会凭空消失
     const marked = DB.chapsOf(Page.bid).filter((c) => c.mark || c.note);
     const bmks = DB.bmksOf(Page.bid);
     const pool = DB.d.tagPool;
@@ -1550,7 +1607,7 @@
       </div>` : ''}
       <div class="row">
         <label>书签（手动加的，不会被覆盖）${bmks.length ? ' · ' + bmks.length + ' 个' : ''}</label>
-        ${bmkListHTML(bmks, '这本书还没有书签喵。读正文时点章节下面那个 🔖 就能加。', true)}
+        ${bmkListHTML(bmks, '这本书还没有书签喵。读正文时点章节下面那个 🔖 就能加。')}
       </div>
       <div class="row">
         <label>书籍标签（点一下选中／取消）</label>
@@ -1560,7 +1617,7 @@
         </div>
       </div>
       <div class="row">
-        <label>总评</label>
+        <label>书评</label>
         <textarea data-review placeholder="这本书读下来感觉如何…">${esc(b.review)}</textarea>
       </div>
       <div class="btns"><button class="btn" data-act="saveBook">保存</button></div>
@@ -1575,13 +1632,16 @@
   let searchKw = '';
   /*
    * 「我的标记」拆成三个 subtab。
-   * 原来把书签、进度、评价全堆在每本书下面，找什么都得先翻书 ——
+   * 原来把书签、进度、书评全堆在每本书下面，找什么都得先翻书 ——
    * 三件事的用法其实完全不同：书签是「回到某处」，进度是「接着读」，
-   * 评价是「这书怎么样」。分开之后各看各的。
+   * 书评是「这书怎么样」。分开之后各看各的。
    * 搜索框在每个 tab 内部生效。
    */
-  const ALL_TABS = [['prog', '▶ 进度'], ['bmk', '🔖 书签'], ['rate', '⭐ 评价']];
+  const ALL_TABS = [['prog', '▶ 进度'], ['bmk', '🔖 书签'], ['rate', '⭐ 书评']];
   let allTab = 'prog';   // 默认看进度：进来最常想知道的是「上次读到哪」
+  // 哪本书的「✏️ 写书评 / 打标签」编辑框是展开的（一次只开一个）。
+  // 存成状态而不是直接 toggle class：点标签会重绘列表，重绘完得还开着
+  let editing = null;
 
   function renderAll(kw) {
     if (kw !== undefined) searchKw = kw;
@@ -1591,10 +1651,10 @@
         ${ALL_TABS.map(([k, label]) =>
           `<button data-tab="${k}" class="${allTab === k ? 'on' : ''}">${label}</button>`).join('')}
       </div>
-      <div class="row"><input type="text" data-search placeholder="搜书名 / 章节 / 备注 / 标签…"
+      <div class="row"><input type="text" data-search placeholder="搜书名 / 章节 / 书评 / 标签…"
         value="${esc(searchKw)}" autocapitalize="off" autocorrect="off"></div>
       <div data-list></div>
-      ${navBtns()}
+      ${navBtns(bookBtn())}
     `;
     paintList();
   }
@@ -1615,6 +1675,39 @@
     return paintRateTab(box, kw);
   }
 
+  /*
+   * ---- 书名后面那支铅笔，和它展开的编辑块 ----
+   * 「进度」和「书评」两个 tab 共用：在哪儿看见这本书，就能在哪儿顺手
+   * 写两句书评、打个标签，不用再点进「这本书」的面板。
+   * 收起来的时候不占地方，所以进度那一栏还是清清爽爽只讲进度。
+   */
+  const penHTML = (bid) =>
+    `<span class="pen" data-pen="${esc(bid)}" title="写书评 / 打标签">✏️</span>`;
+
+  function rvBoxHTML(b) {
+    if (editing !== b.id) return '';
+    return `<div class="rvbox">
+      <div class="tags">
+        ${DB.d.tagPool.map((t) => `<span class="t ${b.tags.includes(t) ? 'on' : ''}"
+          data-btag="${esc(t)}" data-bk="${esc(b.id)}">${esc(t)}</span>`).join('')}
+        <span class="t add" data-newtag="${esc(b.id)}">＋ 新标签</span>
+      </div>
+      <textarea class="rvedit" data-rv="${esc(b.id)}"
+        placeholder="这本书读下来感觉如何…（边写边存）">${esc(b.review)}</textarea>
+      <div class="btns" style="margin-top:6px">
+        <button class="btn sm" data-pendone="${esc(b.id)}">写好了</button>
+      </div>
+    </div>`;
+  }
+
+  // 已经写下的书评，收起编辑框时就是一段纯文本
+  const rvTextHTML = (b) =>
+    (b.review && editing !== b.id
+      ? `<div class="rv">${esc(b.review).replace(/\n/g, '<br>')}</div>` : '');
+
+  const tagPills = (b) => (b.tags || [])
+    .map((t) => `<span class="pill" style="background:#5a6b8c">${esc(t)}</span>`).join('');
+
   // ---- tab 1：书签 ----
   function paintBmkTab(box, kw) {
     const rows = [];
@@ -1629,7 +1722,7 @@
       if (!list.length) continue;
       rows.push(`<div class="book" data-bid="${esc(b.id)}">
         <div class="bt">${bookName(b)} <span class="n">🔖 ${list.length}</span></div>
-        ${bmkListHTML(list, '', true)}
+        ${bmkListHTML(list)}
       </div>`);
     }
     sSub.textContent = total ? `共 ${total} 个书签` : '';
@@ -1660,10 +1753,15 @@
           ${no && total ? `<span class="pill" style="background:#5a6b8c">${no}/${total}</span>` : ''}
           ${hasNew ? `<span class="pill" style="background:#e8554e">▲ 有新章 ${total - no}</span>` : ''}
           ${fin ? '<span class="pill" style="background:#34a853">✓ 读完</span>' : ''}
+          ${penHTML(b.id)}
         </div>
         <div class="meta">▶ 读到「${esc(p.title || '某一章')}」 ${pct}%${
-          b.chapSeenAt ? `　<span style="color:#aeaeb2">章节数是 ${
-            new Date(b.chapSeenAt).toLocaleDateString('zh-CN')} 打开目录时数的</span>` : ''}</div>
+          b.chapCheckedAt || b.chapSeenAt
+            ? `　<span style="color:#aeaeb2">章节数 ${new Date(
+                b.chapCheckedAt || b.chapSeenAt).toLocaleString('zh-CN',
+                { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} 查过</span>`
+            : ''}</div>
+        ${rvBoxHTML(b)}
         <div class="btns" style="margin-top:8px">
           <button class="btn sm" data-jump="${esc(p.url)}">继续读</button>
           ${b.url ? `<button class="btn g sm" data-jump="${esc(b.url)}">去目录</button>` : ''}
@@ -1677,7 +1775,17 @@
       finished.length ? `${finished.length} 本读完` : '',
     ].filter(Boolean).join(' · ');
 
-    const parts = reading.map((x) => row(x, false));
+    const parts = [];
+    if (reading.length) {
+      parts.push(`<div class="btns" style="margin-bottom:6px">
+        <button class="btn g sm" data-act="chkupd">🔄 查一下有没有新章</button>
+      </div>
+      <div class="hint" style="margin:0 0 12px">
+        章节数是脚本<b>自己去数目录</b>得出的（站内那个「有更新」标记不太准）。<br>
+        只查<b>在读、且没标完结</b>的书 —— 完结的文不会再多章节，不用白查。
+      </div>`);
+    }
+    parts.push(...reading.map((x) => row(x, false)));
     if (finished.length) {
       parts.push('<div class="hint" style="margin:14px 0 4px">读完了</div>');
       parts.push(...finished.map((x) => row(x, true)));
@@ -1686,14 +1794,20 @@
       : emptyBox(kw, '还没有阅读进度喵～<br>读几章就会自动记下来');
   }
 
-  // ---- tab 3：书本评价（书籍标签 / 总评 / 章节标记）----
+  /*
+   * ---- tab 3：书评（书籍标签 / 书评 / 章节标记）----
+   * 只列「真的评过」的书：打过标签、写过书评、或者标过章节。
+   * 光有阅读进度不算 —— 那是进度 tab 的事，堆在这里只会把真写过的东西埋掉。
+   * 想给一本还没评过的书补一句：去进度 tab，点书名后面那支 ✏️。
+   */
   function paintRateTab(box, kw) {
     const rows = [];
     let total = 0;
     for (const b of booksByRecent()) {
-      // 列出所有读过的书（不只是「已经有评价」的）——
-      // 否则想给刚读的书补一句总评，还得先去别处点一下才出现在这里
       const cs = DB.chapsOf(b.id).filter((c) => c.mark || c.note);
+      const rated = (b.tags || []).length || b.review || cs.length;
+      // 正在写的那本先留着，不然第一个字还没打完它就自己消失了
+      if (!rated && editing !== b.id) continue;
       total++;
       const hit = !kw ||
         (b.title || '').toLowerCase().includes(kw) ||
@@ -1704,20 +1818,21 @@
 
       const cnt = { good: 0, ok: 0, skip: 0 };
       cs.forEach((c) => { if (c.mark) cnt[c.mark]++; });
-      // 标签和标记数都跟在书名后面，下面那块只留总评 —— 而且能直接改，
-      // 不用再点进「这本书」的面板
+      // 标签和标记数都跟在书名后面。书评写好了就是一段纯文本，
+      // 想改再点铅笔 —— 一直摆个输入框在那儿，列表全是框，读起来累
       rows.push(`<div class="book" data-bid="${esc(b.id)}">
         <div class="bt">${bookName(b)}
-          ${b.tags.map((t) => `<span class="pill" style="background:#5a6b8c">${esc(t)}</span>`).join('')}
+          ${tagPills(b)}
           ${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) =>
             `<span class="pill" style="background:${MARKS[k].color}">${MARKS[k].label} ${v}</span>`).join('')}
+          ${penHTML(b.id)}
         </div>
-        <textarea class="rvedit" data-rv="${esc(b.id)}"
-          placeholder="随手写点什么…（自动保存）">${esc(b.review)}</textarea>
+        ${rvTextHTML(b)}
+        ${rvBoxHTML(b)}
         <div class="btns" style="margin-top:8px">
           ${b.url ? `<button class="btn g sm" data-jump="${esc(b.url)}">去目录</button>` : ''}
           ${cs.length ? `<button class="btn g sm" data-toggle>标记章节 ${cs.length}</button>` : ''}
-          <button class="btn g sm" data-ratedel="${esc(b.id)}">清除评价</button>
+          <button class="btn g sm" data-ratedel="${esc(b.id)}">清除书评</button>
         </div>
         <div class="chaplist">
           ${cs.sort((a, c) => (c.updatedAt || 0) - (a.updatedAt || 0)).map((c) => `
@@ -1729,9 +1844,9 @@
         </div>
       </div>`);
     }
-    sSub.textContent = total ? `${total} 本` : '';
+    sSub.textContent = total ? `${total} 本评过` : '';
     box.innerHTML = rows.length ? rows.join('')
-      : emptyBox(kw, '还没读过什么喵～<br>读几章就会出现在这里');
+      : emptyBox(kw, '还没写过书评、也没打过标签喵～<br>点书名后面那支 ✏️ 就能写');
   }
 
   /*
@@ -1883,6 +1998,16 @@
       <div class="row">
         <label><input type="checkbox" data-auto ${c.autoSync ? 'checked' : ''}> 打开网页时自动后台同步（静默，失败不打扰）</label>
       </div>
+
+      <div class="row">
+        <label>查新章</label>
+        <div class="hint">
+          站点自己那个「有更新」标记不太准，所以章节数是脚本<b>自己去数目录</b>得出的。<br>
+          这件事<b>只在你点的时候才做</b>，不后台偷跑：
+          <b>📑 我的标记 → ▶ 进度 → 🔄 查一下有没有新章</b>。<br>
+          只查在读、且没标完结的书。
+        </div>
+      </div>
       <div class="btns">
         <button class="btn" data-act="saveCfg">保存设置</button>
         <button class="btn g" data-act="syncNow">立即同步</button>
@@ -1916,9 +2041,9 @@
   // 8. 面板交互（事件委托）
   // ==========================================================================
   sBody.addEventListener('click', async (e) => {
-    const t = e.target.closest('[data-mark],[data-act],[data-go],[data-tag],[data-jump],[data-ratedel],' +
+    const t = e.target.closest('[data-act],[data-go],[data-tag],[data-jump],[data-ratedel],' +
       '[data-toggle],[data-bmkgo],[data-bmkdel],[data-bmktoggle],[data-tab],' +
-      '[data-progdel],[data-backon]');
+      '[data-progdel],[data-backon],[data-pen],[data-pendone],[data-btag],[data-newtag]');
     if (!t) return;
 
     // 某个云端的总开关：关掉就不参与同步，设置里也折叠起来不占地方
@@ -1934,9 +2059,55 @@
 
     // ---- 「我的标记」的三个 subtab ----
     if (t.dataset.tab) {
+      flushRvBox();
       allTab = t.dataset.tab;
+      editing = null;
       render();
       sBody.scrollTop = 0;
+      return;
+    }
+
+    /*
+     * ---- 书名后那支铅笔：展开/收起「写书评 + 打标签」----
+     * 只重绘列表（paintList），不重绘整个面板 —— 否则搜索框会被换掉，
+     * iOS 上键盘会闪一下。
+     * 每次重绘前先 flushRvBox()：正在编辑的那段文字还在 DOM 里，
+     * DOM 一换就没了。
+     */
+    if (t.dataset.pen) {
+      flushRvBox();
+      editing = editing === t.dataset.pen ? null : t.dataset.pen;
+      paintList();
+      return;
+    }
+    if (t.dataset.pendone) {
+      flushRvBox();
+      editing = null;
+      paintList(); paintAll();
+      toast('记下了喵 ✓');
+      return;
+    }
+    // 编辑块里的标签（指定哪本书，和「这本书」面板那套 data-tag 不同）
+    if (t.dataset.btag) {
+      flushRvBox();
+      const b = DB.book(t.dataset.bk, false);
+      if (!b) return;
+      const tag = t.dataset.btag;
+      b.tags = b.tags.includes(tag) ? b.tags.filter((x) => x !== tag) : [...b.tags, tag];
+      DB.touch(b);
+      paintList(); paintAll();
+      return;
+    }
+    if (t.dataset.newtag) {
+      flushRvBox();
+      const b = DB.book(t.dataset.newtag, false);
+      const v = prompt('新标签（比如：甜文 / 追更中 / 弃坑）');
+      if (b && v && v.trim()) {
+        DB.addTag(v.trim());
+        if (!b.tags.includes(v.trim())) b.tags.push(v.trim());
+        DB.touch(b);
+        paintList(); paintAll();
+      }
       return;
     }
     // 单独清掉某本书的阅读进度（书和标记都留着）
@@ -1951,7 +2122,9 @@
     // ---- 书签 ----
     if (t.dataset.bmkgo) {
       const m = DB.d.bmks[t.dataset.bmkgo];
-      if (m && !m.deleted) jumpTo(m);
+      // 只认「哪一章」，落地在章首。老数据身上可能还留着 cpct/anchor，
+      // 这里故意不传过去 —— 不然新旧书签的跳转行为会不一样
+      if (m && !m.deleted) jumpTo({ bid: m.bid, cid: m.cid, title: m.title, url: m.url });
       return;
     }
     if (t.dataset.bmkdel) {
@@ -1966,21 +2139,10 @@
       return;
     }
 
-    // 章节标签（点已选中的可取消）
-    if (t.dataset.mark) {
-      const c = DB.chap(Page.bid, Page.cid, true);
-      c.mark = c.mark === t.dataset.mark ? null : t.dataset.mark;
-      c.deleted = false;
-      c.title = Page.title; c.url = chapUrl(Page.cid);
-      DB.touch(c);
-      const b = DB.book(Page.bid, true);
-      if (!b.title && Page.bookTitle) { b.title = Page.bookTitle; DB.touch(b); }
-      render(); paintAll();
-      return;
-    }
     if (t.dataset.go) {
-      if (t.dataset.go === 'book') { forceBook = true; view = 'ctx'; }
-      else { forceBook = false; view = t.dataset.go; }
+      flushRvBox();
+      editing = null;
+      view = t.dataset.go === 'book' ? 'ctx' : t.dataset.go;
       render();
       sBody.scrollTop = 0;
       return;
@@ -1989,17 +2151,17 @@
     // 注意：dataset.toggle 是空字符串（falsy），必须用 hasAttribute 判断
     if (t.hasAttribute('data-toggle')) { t.closest('.book').querySelector('.chaplist').classList.toggle('on'); return; }
     /*
-     * 清除「评价」= 书籍标签 + 总评 + 章节标记/备注。
+     * 清除「书评」= 书籍标签 + 书评 + 章节标记。
      * 书签和阅读进度**不动** —— 三者互相独立，各自在自己那个 tab 里删。
      */
     if (t.dataset.ratedel) {
       const b = DB.d.books[t.dataset.ratedel];
       if (!b) return;
-      confirmBar(`清除「${b.title || b.id}」的标签、总评和章节标记？书签和进度不动`, () => {
+      confirmBar(`清除「${b.title || b.id}」的标签、书评和章节标记？书签和进度不动`, () => {
         b.tags = []; b.review = '';
         DB.touch(b);
         DB.chapsOf(b.id).forEach((c) => { c.deleted = true; c.updatedAt = now(); });
-        DB.save(); render(); paintAll(); toast('已清除这本的评价');
+        DB.save(); editing = null; render(); paintAll(); toast('已清除这本的书评');
       });
       return;
     }
@@ -2013,21 +2175,6 @@
     }
 
     switch (t.dataset.act) {
-      case 'saveChap': {
-        const c = DB.chap(Page.bid, Page.cid, true);
-        c.note = sBody.querySelector('[data-note]').value.trim();
-        c.deleted = false;
-        c.title = Page.title; c.url = chapUrl(Page.cid);
-        DB.touch(c); await DB.saveNow();
-        toast('保存好了喵 ✓'); closeSheet(); paintAll();
-        break;
-      }
-      case 'clearChap': {
-        const c = DB.chap(Page.bid, Page.cid, false);
-        if (c) { c.deleted = true; c.mark = null; c.note = ''; DB.touch(c); }
-        toast('已清除'); render(); paintAll();
-        break;
-      }
       case 'saveBook': {
         const b = DB.book(Page.bid, true);
         b.review = sBody.querySelector('[data-review]').value.trim();
@@ -2048,9 +2195,6 @@
         }
         break;
       }
-      case 'addBmk':
-        toggleBmk(Page.cid, false);
-        break;
       case 'continue':
         jumpTo(DB.prog(Page.bid));
         break;
@@ -2086,6 +2230,10 @@
       }
       case 'syncNow': await Sync.run(false); break;
       case 'diag': await runDiag(); break;
+      case 'chkupd':
+        await checkUpdates();   // 提示语由它自己报（要显示 3/12 这种进度）
+        render();
+        break;
       case 'export': {
         const json = JSON.stringify(Sync.snapshot(), null, 1);
         try {
@@ -2117,7 +2265,7 @@
   let searchTimer;
   const rvTimers = {};
   /*
-   * 行内评价框：边打边存，不用点保存、也不用点进「这本书」的面板。
+   * 铅笔展开的书评框：边打边存，不用点保存、也不用点进「这本书」的面板。
    * 关键是**存完不能重绘面板** —— 一重绘正在打字的那个框就被换掉了，
    * 光标和输入法都会丢。所以只 touch 数据 + 重画网页上的角标。
    */
@@ -2126,7 +2274,21 @@
     if (!b || b.review === text) return;
     b.review = text;
     DB.touch(b);
-    paintAll();          // 网页上的角标（有总评会显示 📝）跟着更新
+    paintAll();          // 网页上的角标（有书评会显示 📝）跟着更新
+  }
+
+  /*
+   * 重绘列表之前，先把编辑框里还没落盘的文字存下来。
+   * 文字只存在 DOM 里，innerHTML 一换就没了 ——
+   * 点标签、点「写好了」、切 tab 都会重绘，所以这几处都得先调一次。
+   * 一次只开一个编辑框，所以 querySelector 拿的就是那一个。
+   */
+  function flushRvBox() {
+    const ta = sBody.querySelector('[data-rv]');
+    if (!ta) return;
+    const bid = ta.getAttribute('data-rv');
+    clearTimeout(rvTimers[bid]);
+    saveReview(bid, ta.value.trim());
   }
   sBody.addEventListener('input', (e) => {
     const rv = e.target.closest && e.target.closest('[data-rv]');
@@ -2224,24 +2386,29 @@
       (nb ? `<span style="margin-left:3px;color:#d98b00" title="${nb} 个书签">🔖${nb > 1 ? nb : ''}</span>` : '');
   }
 
-  // 书籍角标：自定义标签 + 读到哪章 + 标了几章 + 有总评
+  // 书籍角标：自定义标签 + 读到哪章 + 标了几章 + 有书评
   function bookBadgeHTML(b) {
     if (!b || b.deleted) return '';
     const tags = (b.tags || []).map((t) => pill('#5a6b8c', esc(t))).join('');
     const bp = DB.prog(b.id);
-    // 章节名可能很长。以前只是 slice 一刀，遇到窄屏还是会把整行挤到下一行，
-    // 所以这里限宽 + 省略号，并且明确不换行
+    /*
+     * 章节名可能很长。以前只是 slice 一刀，遇到窄屏还是会把整行挤到下一行，
+     * 所以这里限宽 + 省略号，并且明确不换行。
+     * 这一条是**能点的**：点了直接跳回读到的位置（见 data-fw-jump 的处理），
+     * 收藏页 / 书籍主页都不用再先点进去一层。
+     */
     const prog = bp
-      ? `<span style="background:#e8554e;color:#fff;padding:1px 6px;border-radius:8px;` +
+      ? `<span data-fw-jump="${esc(b.id)}" title="点一下跳回读到的位置"` +
+        ` style="background:#e8554e;color:#fff;padding:1px 6px;border-radius:8px;` +
         `margin-left:3px;display:inline-block;max-width:11em;overflow:hidden;` +
-        `text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom">` +
+        `text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;cursor:pointer">` +
         `▶ ${esc(bp.title || '读过')}</span>`
       : '';
     const n = idx().markedCount(b.id);
     const cnt = n ? `<span style="color:#999;margin-left:4px">${n}章</span>` : '';
     const nb = idx().bmksOfBook(b.id).length;
     const bm = nb ? `<span style="color:#d98b00;margin-left:4px" title="${nb} 个书签">🔖${nb}</span>` : '';
-    const rev = b.review ? '<span style="margin-left:3px" title="有总评">📝</span>' : '';
+    const rev = b.review ? '<span style="margin-left:3px" title="有书评">📝</span>' : '';
     return tags + prog + cnt + bm + rev;
   }
 
@@ -2293,22 +2460,111 @@
     let dirty = false;
 
     /*
-     * 章节总数**只认「纯目录列表页」**（/chapter_index）。
-     * 书籍介绍页里嵌的那份目录不可靠 —— 实测同一本书它比目录列表页多一条，
-     * 拿它当分母会让「19/46」变成「19/47」、还凭空多报一章「有新章」。
-     * 章节号（prog.no）不从目录序号推，改从章节标题开头那个整数取 ——
-     * 那是站点自己的编号，每个章节页上都有，也不受这份目录准不准的影响。
+     * 章节总数 = 目录里去重后的章节数。介绍页和纯目录列表页都学。
+     *
+     * 两处可能差一两章：实测同一本书，介绍页那份是「目录列表页那份 + 末尾几章」，
+     * 也就是介绍页更新、目录列表页偶尔落后一点。所以**取较大值** ——
+     * 章节只会增加，这样不管先打开哪个页面都不会来回跳。
      */
-    if (/\/chapter_index/.test(location.pathname)) {
-      if (b.chapTotal !== cids.length) { b.chapTotal = cids.length; dirty = true; }
-      // 只精确到分钟：否则每次重绘都算「变了」，白触发一次保存和同步
-      const seenAt = Math.floor(now() / 60000) * 60000;
-      if (b.chapSeenAt !== seenAt) { b.chapSeenAt = seenAt; dirty = true; }
+    const total = Math.max(cids.length, b.chapTotal || 0);
+    if (b.chapTotal !== total) { b.chapTotal = total; dirty = true; }
+    // 只精确到分钟：否则每次重绘都算「变了」，白触发一次保存和同步
+    const seenAt = Math.floor(now() / 60000) * 60000;
+    if (b.chapSeenAt !== seenAt) { b.chapSeenAt = seenAt; dirty = true; }
+
+    /*
+     * 当前进度那一章排第几。
+     * 不能从章节标题里解析序号 —— 有的书标题是「第二十一章 …」这种中文数字，
+     * 有的干脆只写个名字。目录里的位置才是通用且准确的。
+     */
+    const pg0 = DB.prog(Page.bid);
+    if (pg0) {
+      const i = cids.indexOf(pg0.cid);
+      if (i >= 0 && pg0.no !== i + 1) { pg0.no = i + 1; DB.touch(pg0); }
     }
 
     const done = bookDone();
     if (done !== null && b.done !== done) { b.done = done; dirty = true; }
     if (dirty) DB.touch(b);
+  }
+
+  /*
+   * ---- 查新章 ----
+   * 站点自己那个「有更新」标记实际用起来不准，所以章节数只认自己数目录的结果：
+   * 脚本**同源 fetch** 那本书的目录页数一遍，不用一本本点开。
+   *
+   * 只在用户点「🔄 查一下有没有新章」时才跑，不后台偷跑 ——
+   * 后台定时抓页面是在替用户决定什么时候该给站点发请求，不合适。
+   * 查的范围也收窄：
+   *   · 必须有阅读进度（没读过的书查了也没意义）
+   *   · 站点标了「完结」的跳过 —— 完结的文不会再多章节
+   *   · 已经读完的跳过
+   * 一次最多 CHECK_MAX 本（从最久没查过的开始），剩下的会在提示里说清楚，
+   * 再点一次接着查。
+   */
+  const CHECK_MAX = 40;
+
+  // 从一段目录页 HTML 里数出章节 id（和逛目录时用的是同一套选择器）
+  function cidsFromHtml(html) {
+    // 撞上 WAF 挑战页就当没拿到 —— 硬解没意义
+    if (/awsWafCookieDomainList/.test(html)) return [];
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const out = [];
+    for (const w of doc.querySelectorAll(FW.SEL.catalogWrap)) {
+      for (const a of w.querySelectorAll(FW.SEL.catalogLink)) {
+        const m = /\/posts\/(\d+)/.exec(a.getAttribute('href') || '');
+        if (m && !out.includes(m[1])) out.push(m[1]);
+      }
+    }
+    return out;
+  }
+
+  async function checkOneBook(b) {
+    const r = await fetch(location.origin + '/threads/' + b.id + '/chapter_index',
+      { credentials: 'same-origin' });
+    if (!r.ok) return false;
+    const cids = cidsFromHtml(await r.text());
+    if (!cids.length) return false;
+
+    let hit = false;
+    const total = Math.max(cids.length, b.chapTotal || 0);
+    if (b.chapTotal !== total) { b.chapTotal = total; hit = true; }
+    b.chapSeenAt = now();
+    const pg = DB.prog(b.id);
+    if (pg) {
+      const i = cids.indexOf(pg.cid);
+      if (i >= 0 && pg.no !== i + 1) { pg.no = i + 1; DB.touch(pg); hit = true; }
+    }
+    return hit;
+  }
+
+  async function checkUpdates() {
+    if (!Page.native) { toast('这一页查不了喵，在站内页面再点'); return 0; }
+
+    const due = DB.liveBooks()
+      .filter((b) => DB.prog(b.id) && b.done !== true && !DB.isFinished(b.id))
+      .sort((a, c) => (a.chapCheckedAt || 0) - (c.chapCheckedAt || 0));
+    const list = due.slice(0, CHECK_MAX);
+    if (!list.length) { toast('没有在读的书要查喵'); return 0; }
+
+    let changed = 0, i = 0;
+    for (const b of list) {
+      // 一本本报进度：书多的时候不然就是干等着，不知道卡没卡
+      toast(`查新章 ${++i}/${list.length}…`, 0);
+      try { if (await checkOneBook(b)) changed++; }
+      catch (e) { /* 某一本抓不到就跳过，不打断整轮 */ }
+      b.chapCheckedAt = now();
+      DB.touch(b);
+    }
+    DB.d.lastCheck = now();
+    await DB.saveNow();
+    paintAll();
+    // 被 CHECK_MAX 截掉的必须说出来，不然「查完了」会被当成「全查过了」
+    const rest = due.length - list.length;
+    const more = rest > 0 ? `（还有 ${rest} 本没查，再点一次接着查）` : '';
+    toast(changed ? `有 ${changed} 本的章节数变了喵 ✓${more}`
+                  : `${list.length} 本都查过了，没发现新章${more}`);
+    return changed;
   }
 
   // 站点把「完结 / 连载」做成了书籍标签链接，title 属性拿得最稳。
@@ -2448,6 +2704,7 @@
       const c = DB.chap(Page.bid, ch.pid, false);
       const live = c && !c.deleted;
       const cur = live ? c.mark : null;
+      // 备注已经不写了（章节内只留书签），但老数据里存量的还显示出来
       const note = live ? c.note : '';
       const btn = (extra, attrs, txt) =>
         `<span ${attrs} style="display:inline-block;margin:0 3px;padding:2px 11px;border-radius:11px;cursor:pointer;${extra}">${txt}</span>`;
@@ -2456,12 +2713,12 @@
         Object.entries(MARKS).map(([k, m]) =>
           btn(cur === k ? `background:${m.color};color:#fff;font-weight:700` : 'background:#8881;color:#999',
               `data-fw-mark="${k}" data-fw-pid="${ch.pid}"`, m.label)).join('') +
-        // 两个钮都写全名字：以前只放 emoji，挨在一起太容易点错
-        // —— 备注会弹面板要打字，书签是一点就存，不能让人分不清
-        btn(note ? 'background:#8881;color:#e8554e' : 'background:#8881;color:#999',
-            `data-fw-note="${ch.pid}"`, note ? '📝 备注·有' : '📝 备注') +
-        btn(nb ? 'background:#8881;color:#d98b00;font-weight:700' : 'background:#8881;color:#999',
-            `data-fw-bmk="${ch.pid}"`, nb ? '🔖 书签 ' + nb : '🔖 书签') +
+        // 只放一个图标：标了是亮的、没标是灰的，一眼就分得清，不用写字
+        btn(nb ? 'background:#d98b0022;color:#d98b00;font-weight:700'
+               : 'background:#8881;color:#bbb;filter:grayscale(1)',
+            `data-fw-bmk="${ch.pid}"${nb ? ' data-fw-bmkon="1"' : ''}` +
+            ` title="${nb ? '已加书签，点一下取消' : '给这一章加书签'}"`, '🔖') +
+        (note ? `<span title="${esc(note)}" style="margin-left:6px;color:#8e8e93">📝 ${esc(note.slice(0, 16))}</span>` : '') +
         (prog && prog.cid === ch.pid ? '<span style="margin-left:6px;color:#e8554e;font-weight:700">▶ 读到这里</span>' : '');
       if (bar.innerHTML !== html) bar.innerHTML = html;
     }
@@ -2517,7 +2774,7 @@
       `<span data-fw-open="${v}" style="display:inline-block;margin:0 4px;padding:3px 12px;` +
       `border-radius:12px;cursor:pointer;background:#8881;color:#666">${txt}</span>`;
     const html =
-      btn('book', `📖 标签 / 总评 / 书签${nb ? ' 🔖' + nb : ''}`) +
+      btn('book', `📖 标签 / 书评 / 书签${nb ? ' 🔖' + nb : ''}`) +
       btn('all', `📚 我的标记${nc ? ' · 本书 ' + nc + ' 章' : ''}`) +
       btn('cfg', '⚙️');
     if (bar.innerHTML !== html) bar.innerHTML = html;
@@ -2530,10 +2787,10 @@
   }
   paintAll();
 
-  // 行内标记条的点击：打标签 / 开备注
+  // 行内标记条的点击：打标签 / 加书签；以及各处入口、书名后的进度条
   document.addEventListener('click', (e) => {
     const t = e.target instanceof Element
-      ? e.target.closest('[data-fw-mark],[data-fw-note],[data-fw-bmk],[data-fw-open]') : null;
+      ? e.target.closest('[data-fw-mark],[data-fw-bmk],[data-fw-open],[data-fw-jump]') : null;
     if (!t) return;
     e.preventDefault(); e.stopPropagation();
 
@@ -2543,22 +2800,24 @@
       return;
     }
 
-    const pid = t.getAttribute('data-fw-pid') || t.getAttribute('data-fw-note')
-      || t.getAttribute('data-fw-bmk');
+    /*
+     * 书名后面那个「▶ 读到某章」的小条，点了直接跳回读到的位置。
+     * 它嵌在网站的书名 <a> 里面，所以上面那句 preventDefault 很关键 ——
+     * 不拦的话会顺着链接去书籍主页，而不是跳到读到的那一章。
+     */
+    if (t.hasAttribute('data-fw-jump')) {
+      const p = DB.prog(t.getAttribute('data-fw-jump'));
+      if (p) jumpTo(p); else toast('这本还没有进度喵');
+      return;
+    }
+
+    const pid = t.getAttribute('data-fw-pid') || t.getAttribute('data-fw-bmk');
     if (!Page.bid || !pid) return;
     const ch = Page.chapters.find((x) => x.pid === pid);
 
     // 🔖：正在读的那一章就按当前位置存，别的章就按章首存
     if (t.hasAttribute('data-fw-bmk')) {
-      toggleBmk(pid, pid !== Page.cid);
-      return;
-    }
-
-    // 备注要输入框，交给面板；顺手把焦点章切成它
-    if (t.hasAttribute('data-fw-note')) {
-      Page.cid = pid;
-      if (ch) { Page.title = ch.title; Page.contentEl = ch.body; }
-      openSheet('ctx');
+      toggleBmk(pid);
       return;
     }
 
@@ -2643,7 +2902,32 @@
     DB.saveNow();
   }
   addEventListener('pagehide', flush);
+
+  /*
+   * ---- 回到这个页面时，把别处记的东西拉进来 ----
+   * 为什么非要有这一步：Safari 的「返回」是**页面缓存**，恢复出来的是
+   * 原封不动的老页面 —— 连它内存里那份 DB.d 都是当初加载时的。
+   * 所以「详情页 → 点进某章读 → 返回详情页」，返回后看到的是老进度。
+   * （写入那一侧由 DB._flush 里的逐条合并兜着，数据不会被冲掉；
+   *   这里管的是**显示**要跟上。）
+   *
+   * 三个时机都挂上，各自能覆盖不同情况：
+   *   pageshow(persisted)  从页面缓存恢复（Safari 的返回）
+   *   visibilitychange     切回这个标签页 / 解锁屏幕
+   *   storage              另一个标签页刚写过（同源 localStorage 会广播）
+   */
+  function pullStore() {
+    if (!DB.mergeStored(DB.stored())) return;
+    paintAll();
+    // 正在输入的时候不重绘面板，否则光标和输入法全丢
+    const ae = R.activeElement;
+    const typing = ae && /^(TEXTAREA|INPUT)$/.test(ae.tagName);
+    if (!typing && sheet.classList.contains('on')) render();
+  }
+  addEventListener('pageshow', (e) => { if (e.persisted) pullStore(); });
+  addEventListener('storage', (e) => { if (e.key === '__fwm__db') pullStore(); });
   addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flush();
+    else pullStore();
   });
 })();
