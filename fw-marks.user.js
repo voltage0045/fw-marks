@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.7.0
+// @version      1.7.1
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1223,9 +1223,20 @@
   }
   .chaplist .n { color: #8e8e93; font-size: 11.5px; display: block; }
 
-  .sw { float: right; font-size: 11px; font-weight: 600; padding: 2px 10px;
-    border-radius: 10px; background: #e5e5ea; color: #8e8e93; cursor: pointer; }
-  .sw.on { background: #34a853; color: #fff; }
+  /* 滑动开关。用伪元素做圆钮，省一层 DOM */
+  .sw {
+    float: right; width: 42px; height: 24px; border-radius: 12px;
+    background: #d1d1d6; position: relative; cursor: pointer;
+    transition: background .18s ease; flex: none;
+  }
+  .sw::after {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 20px; height: 20px; border-radius: 50%; background: #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,.28);
+    transition: transform .18s ease;
+  }
+  .sw.on { background: #34a853; }
+  .sw.on::after { transform: translateX(18px); }
 
   .tabs { display: flex; gap: 6px; margin-bottom: 13px; }
   .tabs button {
@@ -1460,8 +1471,8 @@
    * 评价是「这书怎么样」。分开之后各看各的。
    * 搜索框在每个 tab 内部生效。
    */
-  const ALL_TABS = [['bmk', '🔖 书签'], ['prog', '▶ 进度'], ['rate', '⭐ 评价']];
-  let allTab = 'bmk';
+  const ALL_TABS = [['prog', '▶ 进度'], ['bmk', '🔖 书签'], ['rate', '⭐ 评价']];
+  let allTab = 'prog';   // 默认看进度：进来最常想知道的是「上次读到哪」
 
   function renderAll(kw) {
     if (kw !== undefined) searchKw = kw;
@@ -1687,7 +1698,8 @@
 
       <div class="row">
         <label>① GitHub 私有仓库　${c.repoOn ? st('repo') : ''}
-          <span class="sw ${c.repoOn ? 'on' : ''}" data-backon="repo">${c.repoOn ? '已启用' : '已关闭'}</span>
+          <span class="sw ${c.repoOn ? 'on' : ''}" data-backon="repo" role="switch"
+            aria-checked="${!!c.repoOn}" title="${c.repoOn ? '已启用，点一下关闭' : '已关闭，点一下启用'}"></span>
         </label>
         ${!c.repoOn ? '' : `
         <input type="password" data-token placeholder="Token：github_pat_…（细粒度）" value="${esc(c.token)}">
@@ -1705,7 +1717,8 @@
 
       <div class="row">
         <label>② 坚果云 WebDAV　${c.davOn ? st('dav') : ''}
-          <span class="sw ${c.davOn ? 'on' : ''}" data-backon="dav">${c.davOn ? '已启用' : '已关闭'}</span>
+          <span class="sw ${c.davOn ? 'on' : ''}" data-backon="dav" role="switch"
+            aria-checked="${!!c.davOn}" title="${c.davOn ? '已启用，点一下关闭' : '已关闭，点一下启用'}"></span>
         </label>
         ${!c.davOn ? '' : `
         <input type="text" data-davurl placeholder="WebDAV 文件地址" value="${esc(c.davUrl)}">
