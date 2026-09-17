@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.4.3
+// @version      1.5.0
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -123,14 +123,21 @@
   //    site                  学到的本站 URL 规律
   //    删除一律软删（deleted:true + updatedAt），否则同步会把删掉的复活
   // ==========================================================================
+  /*
+   * 所有「可同步的表」都长同一个样子：
+   *   扁平 map + 字符串 key，每条记录带 updatedAt，删除是软删（deleted: true）
+   * 合并逻辑因此只需要一份（逐条比 updatedAt 取新的）。
+   * 以后要加新表（书单、阅读统计之类）只用往这个数组里加一行 ——
+   * load / snapshot / apply 三处会自动跟上。
+   */
+  const COLLECTIONS = ['books', 'chaps', 'bmks', 'prog'];
+
   const DB = {
     d: null,
     async load() {
       this.d = await GMx.get('db', null) || {};
       this.d.v = 1;
-      this.d.books = this.d.books || {};
-      this.d.chaps = this.d.chaps || {};
-      this.d.bmks = this.d.bmks || {};
+      COLLECTIONS.forEach((k) => { this.d[k] = this.d[k] || {}; });
       this.d.tagPool = this.d.tagPool || [];
       this.d.site = this.d.site || {};
       this.d.cfg = Object.assign({
@@ -153,8 +160,52 @@
      * 这类记录一眼可辨（章 ID 不可能等于书 ID），直接清掉，重新读一遍就会记对。
      * 用软删除，这样云端那份也会被一起修掉。
      */
+    /*
+     * 迁移链：一条一条叠加，各自有独立的完成标记。
+     * 以后再改数据结构就加 _mig3，并在下面的表里补一行 —— 不用动别的。
+     * 顺序有意义：mig1 先把假记录清掉，mig2 才不会把假进度搬进新表。
+     */
     migrate() {
-      if (this.d.mig1) { return 0; }
+      const steps = [['mig1', '_mig1'], ['mig2', '_mig2']];
+      let n = 0, ran = false;
+      for (const [flag, fn] of steps) {
+        if (this.d[flag]) continue;
+        n += this[fn]();
+        this.d[flag] = true;
+        ran = true;
+      }
+      if (ran) this.save();
+      return n;
+    },
+
+    /*
+     * v1.4.x → v1.5：把进度从书记录里搬到独立的 prog 表。
+     * 老数据的形状是 books[bid].progress，搬完把那个字段删掉。
+     */
+    _mig2() { return this.migrateLegacyProgress(); },
+
+    /*
+     * 把老形状 books[bid].progress 搬进 prog 表。
+     * 不只首次迁移要用 —— 另一台设备还没更新时，它推上云的数据里进度
+     * 仍然塞在书记录里，所以每次合并完也要再搬一次。
+     */
+    migrateLegacyProgress() {
+      let n = 0;
+      for (const b of Object.values(this.d.books)) {
+        if (!b.progress) continue;
+        const old = this.d.prog[b.id];
+        // 两边都有就以时间新的为准
+        if (!old || (b.updatedAt || 0) > (old.updatedAt || 0)) {
+          this.d.prog[b.id] = Object.assign({ bid: b.id }, b.progress,
+            { updatedAt: b.updatedAt || now(), deleted: false });
+        }
+        delete b.progress;
+        n++;
+      }
+      return n;
+    },
+
+    _mig1() {
       let n = 0;
       const bogus = new Set();
 
@@ -181,8 +232,6 @@
         if (empty) { b.deleted = true; b.updatedAt = now(); n++; }
       }
 
-      this.d.mig1 = true;
-      this.save();
       return n;
     },
 
@@ -197,8 +246,47 @@
     book(bid, create) {
       if (!bid) return null;
       let b = this.d.books[bid];
-      if (!b && create) b = this.d.books[bid] = { id: bid, title: '', url: '', tags: [], review: '', progress: null, updatedAt: now() };
+      if (!b && create) b = this.d.books[bid] = { id: bid, title: '', url: '', tags: [], review: '', updatedAt: now() };
       return b || null;
+    },
+
+    /*
+     * ---- 阅读进度：单独一张表，不再塞在书记录里 ----
+     * 原因：读书时进度一直在刷新，塞在书记录里会让 book.updatedAt 一直变。
+     * 而合并是「整条记录取最新」，于是另一台设备刚加的标签/总评会被
+     * 进度带起来的那次更新整条盖掉。拆开之后两者互不干扰。
+     */
+    prog(bid) {
+      if (!bid) return null;
+      const p = this.d.prog[bid];
+      if (!p || p.deleted) return null;
+      // 书整本被删了，进度也就不该再显示 —— 否则「我的标记」里删掉之后，
+      // 书籍详情页还在提示「上次读到…」
+      const b = this.d.books[bid];
+      if (b && b.deleted) return null;
+      return p;
+    },
+
+    /*
+     * 这本书最后一次「有动静」是什么时候 —— 用来给列表排序。
+     * 进度拆成独立表之后，光看 book.updatedAt 是不够的：
+     * 一直在读的书，书记录本身可能好久没变过。
+     * 以后再加新表，往这里补一行就行。
+     */
+    lastActive(bid) {
+      const b = this.d.books[bid];
+      const p = this.d.prog[bid];
+      return Math.max(
+        (b && b.updatedAt) || 0,
+        (p && !p.deleted && p.updatedAt) || 0,
+      );
+    },
+    setProg(bid, pos) {
+      if (!bid || !pos) return null;
+      const p = Object.assign({}, this.d.prog[bid], pos, { bid, deleted: false });
+      this.d.prog[bid] = p;
+      this.touch(p);
+      return p;
     },
     chap(bid, cid, create) {
       if (!bid || !cid) return null;
@@ -400,10 +488,10 @@
     busy: false,
     // 只把需要跨设备的部分传上去；token / 密码绝不上传
     snapshot() {
-      return {
-        v: 1, books: DB.d.books, chaps: DB.d.chaps, bmks: DB.d.bmks,
-        tagPool: DB.d.tagPool, site: DB.d.site, savedAt: now(),
-      };
+      // 白名单式：只列要传的东西。cfg（token / 应用密码）永远不在里面
+      const snap = { v: 1, tagPool: DB.d.tagPool, site: DB.d.site, savedAt: now() };
+      COLLECTIONS.forEach((k) => { snap[k] = DB.d[k]; });
+      return snap;
     },
     // 合并：同一条记录谁的 updatedAt 新就留谁
     mergeMap(local, remote) {
@@ -416,9 +504,11 @@
     },
     apply(remote) {
       if (!remote || remote.v !== 1) throw new Error('数据格式不认识');
-      DB.d.books = this.mergeMap(DB.d.books, remote.books || {});
-      DB.d.chaps = this.mergeMap(DB.d.chaps, remote.chaps || {});
-      DB.d.bmks = this.mergeMap(DB.d.bmks, remote.bmks || {});
+      COLLECTIONS.forEach((k) => {
+        DB.d[k] = this.mergeMap(DB.d[k], remote[k] || {});
+      });
+      // 老版本的云端数据里进度还塞在书记录里，合并完顺手搬到 prog 表
+      DB.migrateLegacyProgress();
       DB.d.tagPool = [...new Set([...DB.d.tagPool, ...(remote.tagPool || [])])];
       if (remote.site && !Object.keys(DB.d.site).length) DB.d.site = remote.site;
     },
@@ -823,10 +913,14 @@
     record() {
       const p = this.capture();
       if (!p) return;
+      // 进度写进独立的 prog 表。只有书名/地址这类真变了才动书记录 ——
+      // 否则一边读一边刷 book.updatedAt，会把另一台设备刚加的标签盖掉
+      DB.setProg(Page.bid, p);
       const b = DB.book(Page.bid, true);
-      b.progress = p; b.url = b.url || '';
-      if (!b.title && Page.bookTitle) b.title = Page.bookTitle;
-      DB.touch(b);
+      let dirty = false;
+      if (!b.title && Page.bookTitle) { b.title = Page.bookTitle; dirty = true; }
+      if (!b.url && Page.native) { b.url = FW.catalogUrl(Page.bid); dirty = true; }
+      if (dirty) DB.touch(b);
     },
     // 回到上次位置：优先用锚文本，找不到再退回百分比
     restore(p) {
@@ -970,13 +1064,13 @@
     if (jumpHere) setTimeout(() => Progress.restore(jump), 400);
 
     // 否则：上次读到的那一章就在本页时，问一句要不要接着读
-    const b = DB.book(Page.bid, false);
-    const here = b && b.progress && Page.chapters.some((c) => c.pid === b.progress.cid);
-    if (!jumpHere && here && (b.progress.cpct > 0.03 || b.progress.pct > 0.03) && window.scrollY < 50) {
+    const pg = DB.prog(Page.bid);
+    const here = pg && Page.chapters.some((c) => c.pid === pg.cid);
+    if (!jumpHere && here && (pg.cpct > 0.03 || pg.pct > 0.03) && window.scrollY < 50) {
       setTimeout(() => {
-        const nm = b.progress.title ? `「${b.progress.title}」` : '上次的位置';
-        confirmBar(`上次读到 ${nm} ${Math.round((b.progress.cpct || b.progress.pct) * 100)}%，回去吗？`,
-          () => Progress.restore(b.progress));
+        const nm = pg.title ? `「${pg.title}」` : '上次的位置';
+        confirmBar(`上次读到 ${nm} ${Math.round((pg.cpct || pg.pct) * 100)}%，回去吗？`,
+          () => Progress.restore(pg));
       }, 600);
     }
   }
@@ -1244,6 +1338,7 @@
   function renderBook() {
     if (!Page.bid) return renderUnknown('书籍');
     const b = DB.book(Page.bid, true);
+    const pg = DB.prog(Page.bid);
     const marked = DB.chapsOf(Page.bid).filter((c) => c.mark || c.note);
     const bmks = DB.bmksOf(Page.bid);
     const pool = DB.d.tagPool;
@@ -1251,9 +1346,9 @@
     sSub.textContent = [marked.length ? `已标 ${marked.length} 章` : '',
                         bmks.length ? `🔖 ${bmks.length}` : ''].filter(Boolean).join(' · ');
     sBody.innerHTML = `
-      ${b.progress ? `<div class="row">
+      ${pg ? `<div class="row">
         <label>阅读进度（自动记的，会被覆盖）</label>
-        <button class="btn" data-act="continue">▶ 继续读：${esc(b.progress.title || '上次的位置')} · ${Math.round((b.progress.cpct || b.progress.pct || 0) * 100)}%</button>
+        <button class="btn" data-act="continue">▶ 继续读：${esc(pg.title || '上次的位置')} · ${Math.round((pg.cpct || pg.pct || 0) * 100)}%</button>
       </div>` : ''}
       <div class="row">
         <label>书签（手动加的，不会被覆盖）${bmks.length ? ' · ' + bmks.length + ' 个' : ''}</label>
@@ -1294,7 +1389,8 @@
 
   function paintList() {
     const kw = searchKw;
-    const books = DB.liveBooks().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    // 按「最后有动静」排，最近读的排最前（进度是独立表，得一起算进来）
+    const books = DB.liveBooks().sort((a, b) => DB.lastActive(b.id) - DB.lastActive(a.id));
     const hit = (b) => {
       if (!kw) return true;
       const k = kw.toLowerCase();
@@ -1313,6 +1409,7 @@
       ${list.length ? list.map((b) => {
         const cs = DB.chapsOf(b.id).filter((c) => c.mark || c.note);
         const bs = DB.bmksOf(b.id);
+        const bp = DB.prog(b.id);
         const cnt = { good: 0, ok: 0, skip: 0 };
         cs.forEach((c) => { if (c.mark) cnt[c.mark]++; });
         return `<div class="book" data-bid="${esc(b.id)}">
@@ -1321,12 +1418,12 @@
             ${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) =>
               `<span class="pill" style="background:${MARKS[k].color}">${MARKS[k].label} ${v}</span>`).join('')}
             ${b.tags.length ? '<br>🏷 ' + b.tags.map(esc).join(' · ') : ''}
-            ${b.progress ? `<br>▶ 读到「${esc(b.progress.title || '')}」${Math.round((b.progress.cpct || b.progress.pct || 0) * 100)}%` : ''}
+            ${bp ? `<br>▶ 读到「${esc(bp.title || '')}」${Math.round((bp.cpct || bp.pct || 0) * 100)}%` : ''}
             ${bs.length ? `<br>🔖 ${bs.length} 个书签` : ''}
           </div>
           ${b.review ? `<div class="rv">${esc(b.review)}</div>` : ''}
           <div class="btns" style="margin-top:8px">
-            ${b.progress ? `<button class="btn sm" data-jump="${esc(b.progress.url)}">继续读</button>` : ''}
+            ${bp ? `<button class="btn sm" data-jump="${esc(bp.url)}">继续读</button>` : ''}
             ${b.url ? `<button class="btn g sm" data-jump="${esc(b.url)}">去目录</button>` : ''}
             ${cs.length ? `<button class="btn g sm" data-toggle>标记章节 ${cs.length}</button>` : ''}
             ${bs.length ? `<button class="btn g sm" data-bmktoggle>🔖 书签 ${bs.length}</button>` : ''}
@@ -1481,6 +1578,8 @@
         b.deleted = true; b.updatedAt = now();
         DB.chapsOf(b.id).forEach((c) => { c.deleted = true; c.updatedAt = now(); });
         DB.bmksOf(b.id).forEach((m) => { m.deleted = true; m.updatedAt = now(); });
+        const pg = DB.prog(b.id);
+        if (pg) { pg.deleted = true; pg.updatedAt = now(); }   // 进度现在是独立一张表，别漏
         DB.save(); render(); paintAll(); toast('已删除喵');
       });
       return;
@@ -1533,11 +1632,9 @@
       case 'addBmk':
         toggleBmk(Page.cid, false);
         break;
-      case 'continue': {
-        const b = DB.book(Page.bid, false);
-        if (b && b.progress) jumpTo(b.progress);
+      case 'continue':
+        jumpTo(DB.prog(Page.bid));
         break;
-      }
       case 'saveCfg': {
         const v = (s) => sBody.querySelector(s).value.trim();
         DB.d.cfg.token = v('[data-token]');
@@ -1637,8 +1734,9 @@
   function bookBadgeHTML(b) {
     if (!b || b.deleted) return '';
     const tags = (b.tags || []).map((t) => pill('#5a6b8c', esc(t))).join('');
-    const prog = b.progress
-      ? pill('#e8554e', '▶ ' + esc((b.progress.title || '').slice(0, 14) || '读过'))
+    const bp = DB.prog(b.id);
+    const prog = bp
+      ? pill('#e8554e', '▶ ' + esc((bp.title || '').slice(0, 14) || '读过'))
       : '';
     const n = DB.chapsOf(b.id).filter((c) => c.mark || c.note).length;
     const cnt = n ? `<span style="color:#999;margin-left:4px">${n}章</span>` : '';
@@ -1660,7 +1758,7 @@
             })
           : Page.chapterLinks);
 
-    const prog = (DB.book(Page.bid, false) || {}).progress;
+    const prog = DB.prog(Page.bid);
     for (const a of links) {
       // 桌面版目录一行里有两个链接指向同一章，只在最后那个上挂角标，免得画两遍
       const row = a.closest('tr');
@@ -1706,16 +1804,32 @@
     const c = DB.chap(Page.bid, cid, false);
     if (c && !c.deleted && richer(name, c.title)) { c.title = name; DB.touch(c); }
 
-    const b = DB.book(Page.bid, false);
-    if (b && b.progress && b.progress.cid === cid && richer(name, b.progress.title)) {
-      b.progress.title = name; DB.touch(b);
-    }
+    const pg = DB.prog(Page.bid);
+    if (pg && pg.cid === cid && richer(name, pg.title)) { pg.title = name; DB.touch(pg); }
     DB.bmksOf(Page.bid).forEach((m) => {
       if (m.cid === cid && richer(name, m.title)) { m.title = name; DB.touch(m); }
     });
   }
 
   // ---- 书籍介绍页：书名后挂标签 + 目录上方一条「上次读到哪」 ----
+  /*
+   * 「上次读到」提示条和那排操作按钮该挂在哪。
+   * 原来死绑在目录容器上 —— 可书籍主页不一定嵌着目录（长书只给一个「目录」链接），
+   * 那时候整块就都不显示了。改成多级兜底，总之别因为找不到锚点就消失。
+   * 两处共用同一个宿主，顺序才好控制（提示条在上、按钮排在下）。
+   */
+  function pageHost() {
+    const wrap = document.querySelector(FW.SEL.catalogWrap);
+    const panel = wrap && wrap.closest('.panel-body');
+    if (panel) return panel;
+
+    const crumbs = document.querySelectorAll(FW.SEL.bookCrumb(Page.bid));
+    const crumb = crumbs[crumbs.length - 1];
+    if (crumb && crumb.closest('div')) return crumb.closest('div');
+
+    return document.querySelector('.panel-body') || null;
+  }
+
   function paintProfile() {
     if (Page.type !== 'catalog' || !Page.bid) return;
     const b = DB.book(Page.bid, false);
@@ -1724,11 +1838,9 @@
     const crumbs = document.querySelectorAll(FW.SEL.bookCrumb(Page.bid));
     if (crumbs.length) attachBadge(crumbs[crumbs.length - 1], bookBadgeHTML(b));
 
-    // 进度条压在目录容器所在面板的最上面（只插一条，不然手机/桌面两份都会显示）
-    const wrap = document.querySelector(FW.SEL.catalogWrap);
-    const panel = wrap && wrap.closest('.panel-body');
+    const panel = pageHost();
     if (!panel) return;
-    const p = b && b.progress;
+    const p = DB.prog(Page.bid);
     let strip = panel.querySelector(':scope > [data-fw-strip]');
     if (!p) { if (strip) strip.remove(); return; }
     if (!strip) {
@@ -1739,10 +1851,7 @@
         'background:#e8554e14;border:1px solid #e8554e55;color:#e8554e;' +
         'font-size:13px;line-height:1.5;text-align:center';
       // 点的时候重新读一遍进度，别用建条子那一刻捕获的旧值
-      strip.addEventListener('click', () => {
-        const bb = DB.book(Page.bid, false);
-        if (bb && bb.progress) jumpTo(bb.progress);
-      });
+      strip.addEventListener('click', () => jumpTo(DB.prog(Page.bid)));
       panel.insertBefore(strip, panel.firstChild);
     }
     const html = `▶ 上次读到 <b>${esc(p.title || '某一章')}</b> · ${Math.round((p.cpct || p.pct || 0) * 100)}% —— 点这里继续`;
@@ -1773,7 +1882,7 @@
   // ---- 正文页：每章标题下面一条行内标记条 ----
   function paintInline() {
     if (Page.type !== 'chapter' || !Page.bid || !Page.chapters.length) return;
-    const prog = (DB.book(Page.bid, false) || {}).progress;
+    const prog = DB.prog(Page.bid);
     for (const ch of Page.chapters) {
       const anchor = ch.titleEl.closest('.text-center') || ch.titleEl.parentElement;
       if (!anchor) continue;
@@ -1838,8 +1947,7 @@
 
   function injectPageActions() {
     if (Page.type !== 'catalog' || !Page.bid) return;
-    const wrap = document.querySelector(FW.SEL.catalogWrap);
-    const panel = wrap && wrap.closest('.panel-body');
+    const panel = pageHost();
     if (!panel) return;
 
     let bar = panel.querySelector(':scope > [data-fw-actions]');

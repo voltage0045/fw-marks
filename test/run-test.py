@@ -115,19 +115,20 @@ SEED = {
     'books': {
         TID: {
             'id': TID, 'title': '测试书', 'url': f'/threads/{TID}/profile',
-            'tags': ['追更中', '甜文'], 'review': '总评测试',
-            'progress': {
-                'cid': PID_PROGRESS, 'title': '第一章', 'url': f'/posts/{PID_PROGRESS}',
-                'pct': 0.4, 'cpct': 0.55, 'anchor': '', 'ts': 1,
-            },
-            'updatedAt': 1,
+            'tags': ['追更中', '甜文'], 'review': '总评测试', 'updatedAt': 1,
         },
-        # v1.0 留下的假数据：progress.cid == 书 ID，点了等于原地刷新
         BOGUS_TID: {
             'id': BOGUS_TID, 'title': '旧版假数据', 'url': '', 'tags': [], 'review': '',
-            'progress': {'cid': BOGUS_TID, 'title': '', 'url': f'/threads/{BOGUS_TID}/profile',
-                         'pct': 0.5, 'anchor': '', 'ts': 1},
             'updatedAt': 1,
+        },
+    },
+    # 阅读进度：v1.5 起是独立一张表，不再塞在书记录里
+    'prog': {
+        TID: {
+            'bid': TID, 'cid': PID_PROGRESS, 'title': '第一章',
+            'url': f'/posts/{PID_PROGRESS}',
+            # updatedAt 特意给大，用来验「最近读的排最前」
+            'pct': 0.4, 'cpct': 0.55, 'anchor': '', 'ts': 1, 'updatedAt': 5000,
         },
     },
     'chaps': {
@@ -154,20 +155,21 @@ SEED = {
     },
     'tagPool': ['追更中', '甜文', '弃坑', '列表验证'],
     'site': {},
-    'cfg': {'token': '', 'gistId': '', 'davUrl': '', 'davUser': '', 'davPass': '', 'autoSync': False},
+    'cfg': {'token': '', 'repo': '', 'davUrl': '', 'davUser': '', 'davPass': '', 'autoSync': False},
     'lastSync': 9999999999999,
     'status': {},
     # 默认就标成「已迁移」，否则测试台每开一页都重灌一次种子、
-    # 迁移就又跑一遍，「修好了 3 条旧版记录」的提示会没完没了地弹。
-    # 想验迁移的用例走 ?fwtest=legacy，那时才把这个标记去掉
+    # 迁移就又跑一遍，提示会没完没了地弹。
+    # 想验迁移的用例走 ?fwtest=legacy，那时才把这些标记去掉
     'mig1': True,
+    'mig2': True,
 }
 
 # 各列表页的样本书也塞进种子，统一打「列表验证」标签
 for _page, _tid in LIST_TIDS.items():
     SEED['books'][_tid] = {
         'id': _tid, 'title': f'列表样本-{_page}', 'url': '',
-        'tags': ['列表验证'], 'review': '', 'progress': None, 'updatedAt': 1,
+        'tags': ['列表验证'], 'review': '', 'updatedAt': 1,
     }
 
 # ---- 断言：在页面里跑，结果写进 #FWTEST ----
@@ -229,11 +231,15 @@ CHECK_JS = r"""
       barPlain: barOf('__PID_CLICK__'),
       renameBtns: n('[data-bmkname]'),
       // v1.0 假数据迁移
-      migFlag: d.mig1 === true,
+      migFlag: d.mig1 === true && d.mig2 === true,
       migProgressCleared: bogus ? !bogus.progress : null,
       migBookDeleted: bogus ? !!bogus.deleted : null,
       migChapDeleted: bogusChap ? !!bogusChap.deleted : null,
-      migRealKept: real ? !real.deleted && !!real.progress : null,
+      migRealKept: real ? !real.deleted : null,
+      // v1.5：进度搬进独立的 prog 表，书记录里那个字段要消失
+      progTable: (d.prog || {})['__TID__'] || null,
+      progLeftInBook: real ? !!real.progress : null,
+      progBogusMoved: !!(d.prog || {})['__BOGUS__'],
 
       // 悬浮球有没有把页面上的链接盖住 —— 盖住了的话真站上也会「点不了」。
       // elementFromPoint 是唯一靠谱的判法：光看 CSS 说 display:none 不算数。
@@ -283,8 +289,15 @@ CHECK_JS = r"""
       if (!a) { r.navOpens = null; return; }
       a.click();
       var h = document.getElementById('__fw_marks__');
-      var sh = h && h.shadowRoot ? h.shadowRoot.querySelector('.sheet') : null;
+      var sr = h && h.shadowRoot;
+      var sh = sr ? sr.querySelector('.sheet') : null;
       r.navOpens = !!(sh && sh.classList.contains('on'));
+      // 取书 id 而不是书名：书名会被页面上的真实标题覆盖（noteBook 会更新它），
+      // 拿 id 比才稳，也不用把站点内容写进断言
+      r.allListOrder = sr
+        ? [].map.call(sr.querySelectorAll('.book'),
+            function (e) { return e.getAttribute('data-bid'); }).slice(0, 3)
+        : [];
       var cls = h && h.shadowRoot ? h.shadowRoot.querySelector('.cls') : null;
       if (cls) cls.click();   // 关回去，别影响后面的断言
     })();
@@ -329,8 +342,9 @@ CHECK_JS = r"""
         var d2 = db();
         var bk = (d2.books || {})['__TID__'] || {};
         r.scrollTested = true;
-        r.progAfterScroll = bk.progress ? bk.progress.cid : null;
-        r.progHasPos = !!(bk.progress && typeof bk.progress.cpct === 'number');
+        var pg = (d2.prog || {})['__TID__'];
+        r.progAfterScroll = pg ? pg.cid : null;
+        r.progHasPos = !!(pg && typeof pg.cpct === 'number');
         r.savedAt = d2.savedAt || 0;
         finish();
       }, 900);
@@ -376,9 +390,24 @@ JUMP_POS = {
 def inject_html(html, query=''):
     # 全程用拼接，不用 % 格式化 —— 注入的内容里要是带个 % 就会被当成格式符炸掉
     data = SEED
-    if 'fwtest=legacy' in query:
-        data = dict(SEED)
-        data.pop('mig1', None)      # 让迁移真的跑一遍
+    if 'fwtest=deleted' in query:
+        # 书被「我的标记」里删掉之后，书籍详情页不该还显示「上次读到」。
+        # 注意只删书、不动 prog —— 要验的正是「书没了，进度就不该再显示」
+        data = json.loads(json.dumps(SEED))
+        data['books'][TID]['deleted'] = True
+
+    elif 'fwtest=legacy' in query:
+        # 深拷贝后退回 v1.4 的老结构：进度塞在书记录里、prog 表空着，
+        # 再把迁移标记去掉 —— 这样 mig1（清假数据）和 mig2（进度搬家）都会真跑
+        data = json.loads(json.dumps(SEED))
+        data.pop('mig1', None)
+        data.pop('mig2', None)
+        data['books'][TID]['progress'] = dict(SEED['prog'][TID])
+        data['books'][BOGUS_TID]['progress'] = {
+            'cid': BOGUS_TID, 'title': '', 'url': f'/threads/{BOGUS_TID}/profile',
+            'pct': 0.5, 'anchor': '', 'ts': 1,
+        }
+        data['prog'] = {}
     seed = json.dumps(json.dumps(data))
     parts = ['<script>try{localStorage.setItem("__fwm__db", ' + seed + ')}catch(e){}</script>']
     if 'fwtest=landing' in query:
@@ -534,8 +563,13 @@ def static_checks():
         m = re.search(pattern, s, re.S)
         return m.group(0) if m else ''
 
-    snap = body_of(r'snapshot\(\)\s*\{.*?\n    \},')
-    apply_ = body_of(r'apply\(remote\)\s*\{.*?\n    \},')
+    # 扫之前先把注释去掉 —— 注释里提一句「cfg / token」不算泄漏，
+    # 但会让检查误报（之前就踩过）
+    def code_only(x):
+        return re.sub(r'//.*', '', x)
+
+    snap = code_only(body_of(r'snapshot\(\)\s*\{.*?\n    \},'))
+    apply_ = code_only(body_of(r'apply\(remote\)\s*\{.*?\n    \},'))
     secrets = ('cfg', 'token', 'davPass', 'davUser')
 
     checks.append(('snapshot() 存在（能被解析到）', bool(snap)))
@@ -550,6 +584,12 @@ def static_checks():
                    not re.search(r'^// @connect\s+\*\s*$', s, re.M)))
     checks.append(('已经不再用 secret gist 存数据',
                    'gistId' not in s and 'data-gist' not in s))
+    # 同步哪些表由 COLLECTIONS 一处决定，所以直接盯住它别混进凭据
+    m = re.search(r"const COLLECTIONS = \[(.*?)\]", s)
+    coll = [x.strip().strip("'\"") for x in (m.group(1).split(',') if m else [])]
+    checks.append(('同步的表清单是白名单，且不含 cfg',
+                   bool(coll) and 'cfg' not in coll and
+                   set(coll) == {'books', 'chaps', 'bmks', 'prog'}))
 
     print('=== 静态检查（源码级，不开浏览器）===')
     ok = 0
@@ -587,7 +627,13 @@ def main():
             ('目录上方有 3 个操作按钮', lambda r: r['pageActions'] == 3),
             ('顶栏那一项写着「我的标记」', lambda r: '我的标记' in r['navText']),
             ('点顶栏入口能打开面板',   lambda r: r['navOpens'] is True),
+            ('最近读的书排在列表最前', lambda r: (r.get('allListOrder') or [None])[0] == TID),
             ('页面链接没被挡住',       lambda r: not r['blockedLinks']),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=deleted', '删掉的书 → 详情页不该再显示进度', [
+            ('没有「上次读到」提示条', lambda r: r['strips'] == 0),
+            ('书名后也不挂 ▶ 进度',   lambda r: '▶' not in r['badgeText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}/chapter_index', '纯目录列表页', [
@@ -646,10 +692,14 @@ def main():
             ('书名后挂了标签',         lambda r: r['bookItemBadge'] >= 1),
             ('标签内容正确',           lambda r: '追更中' in r['badgeText'] and '▶' in r['badgeText']),
             ('书名后显示书签数 🔖2',   lambda r: '🔖2' in r['badgeText']),
-            ('v1.0 假数据已迁移',      lambda r: r['migFlag'] and r['migProgressCleared']),
+            ('两步迁移都跑过了',       lambda r: r['migFlag'] and r['migProgressCleared']),
             ('假章节记录已软删',       lambda r: r['migChapDeleted']),
             ('空壳假书已软删',         lambda r: r['migBookDeleted']),
-            ('真书和它的进度没被误删', lambda r: r['migRealKept']),
+            ('真书没被误删',           lambda r: r['migRealKept']),
+            ('进度搬进了独立的 prog 表',
+             lambda r: (r.get('progTable') or {}).get('cid') == PID_PROGRESS),
+            ('书记录里不再残留 progress', lambda r: r.get('progLeftInBook') is False),
+            ('假进度没被搬进新表（先被清掉了）', lambda r: r.get('progBogusMoved') is False),
             ('假书不再显示 ▶ 进度',    lambda r: '旧版假数据' not in r['badgeText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
@@ -724,6 +774,8 @@ def main():
             print(f'  {"✅" if ok else "❌"} {name}')
         if r['jsErrors']:
             print('   JS 报错：', r['jsErrors'])
+        if r.get('allListOrder') is not None:
+            print('   列表顺序：', r['allListOrder'])
         if r.get('blockedLinks'):
             for b in r['blockedLinks']:
                 print('   被挡：', b)
