@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.7.1
+// @version      1.7.2
 // @description  章节标签(精彩/一般/跳过)+备注、书签(多个/手动/免命名)、整本书总评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1605,24 +1605,31 @@
    *   · 坚果云：列出账号下**真实存在**的同步文件夹（地址里文件夹名写错是头号原因），
    *            并把服务器自报的原因（比如 AccountExpired）原样显示出来
    */
+  let lastDiag = '';
   async function runDiag() {
     const box = sBody.querySelector('[data-diag]');
     if (!box) return;
     const line = (s) => `<div style="margin:3px 0">${s}</div>`;
     box.innerHTML = `<div class="hint">检查中…</div>`;
     const out = [];
+    // 诊断结论要顺手写回状态，否则上面那行还挂着「上次同步」的旧报错，
+    // 和刚跑出来的结果自相矛盾
+    const mark = (key, ok, err) => { DB.d.status[key] = { ok, ts: now(), err: err || '' }; };
 
     // ---- GitHub 私有仓库 ----
     if (Backends.repo.ready()) {
       try {
         const { base, ref } = Backends.repo.api();
         const r = await GMx.req(base + ref, { headers: Backends.repo.hdr() });
+        const good = r.status < 300 || r.status === 404;
+        mark('repo', good, good ? '' : Backends.repo.err(r.status, r.text));
         out.push(r.status === 404
           ? line('✅ GitHub：仓库能访问，数据文件还没建（首次同步会自动创建）')
           : r.status < 300
             ? line('✅ GitHub：读写正常')
             : line('❌ GitHub：' + esc(Backends.repo.err(r.status, r.text))));
       } catch (e) {
+        mark('repo', false, e.message);
         out.push(line('❌ GitHub：' + esc(e.message)));
       }
     } else {
@@ -1638,6 +1645,7 @@
           headers: Object.assign({ Depth: '1' }, Backends.dav.hdr()),
         });
         if (r.status >= 300) {
+          mark('dav', false, Backends.dav.err(r.status, r.text));
           out.push(line('❌ 坚果云：' + esc(Backends.dav.err(r.status, r.text))));
         } else {
           const names = [...String(r.text).matchAll(/<[^>]*href>(.*?)<\/[^>]*href>/gi)]
@@ -1659,20 +1667,25 @@
           });
           if (w.status < 300) {
             await GMx.req(probe, { method: 'DELETE', headers: Backends.dav.hdr() });
+            mark('dav', true, '');
             out.push(line('✅ 坚果云：写权限正常'));
           } else {
+            mark('dav', false, Backends.dav.err(w.status, w.text));
             out.push(line('❌ 坚果云写入失败：' + esc(Backends.dav.err(w.status, w.text))));
           }
         }
       } catch (e) {
+        mark('dav', false, e.message);
         out.push(line('❌ 坚果云：' + esc(e.message)));
       }
     } else {
       out.push(line('— 坚果云：没配'));
     }
 
-    box.innerHTML = `<div class="hint" style="background:#f7f7f9;padding:10px;
+    lastDiag = `<div class="hint" style="background:#f7f7f9;padding:10px;
       border-radius:9px;margin-top:10px;line-height:1.8">${out.join('')}</div>`;
+    await DB.saveNow();
+    render();   // 重渲染让上面那行状态跟着更新；lastDiag 会被一起画回去
   }
 
   // ---- 设置 / 同步 ----
@@ -1743,7 +1756,7 @@
         <button class="btn g" data-act="syncNow">立即同步</button>
         <button class="btn g" data-act="diag">🔍 测试连接</button>
       </div>
-      <div data-diag></div>
+      <div data-diag>${lastDiag}</div>
       <div class="hint">Token 和密码<b>只存在这台设备</b>，永远不会被传到任何云端喵。</div>
       <div class="row" style="margin-top:22px">
         <label>本地备份</label>
@@ -1780,6 +1793,7 @@
     if (t.dataset.backon) {
       const k = t.dataset.backon === 'repo' ? 'repoOn' : 'davOn';
       DB.d.cfg[k] = !DB.d.cfg[k];
+      lastDiag = '';
       await DB.saveNow();
       toast(DB.d.cfg[k] ? '已启用' : '已关闭，不再参与同步');
       render();
@@ -1921,6 +1935,7 @@
         set('repoPath', v('[data-repopath]'), 'fw-marks.json');
         set('repoBranch', v('[data-repobranch]'));
         Backends.repo._sha = null;   // 换了仓库/路径，旧的文件版本号就作废了
+        lastDiag = '';               // 配置变了，上次的诊断结论就不作数了
         set('davUrl', v('[data-davurl]'));
         set('davUser', v('[data-davuser]'));
         set('davPass', v('[data-davpass]'));
