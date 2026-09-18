@@ -38,7 +38,7 @@ python3 test/run-test.py
 
 === 单章固定链接页 ===           === 收藏 / 首页 / 频道 / 索引 ===
   ✅ 只认出 1 章（回帖没被算进来） ✅ 书名后挂上了标签
-137/137 通过
+150/150 通过
 ```
 
 覆盖的页面：首页、收藏、文库、书籍介绍、纯目录列表、正文、单章固定链接、
@@ -54,9 +54,10 @@ python3 test/run-test.py
   [存储层的坑之二](#存储层的坑之二整包覆盖会互相冲掉v111-修)）
 - 查新章只能手动触发，不许挂后台定时器（静态检查 + `?fwtest=upd`）
 - 详情页学过章节列表后，目录列表页不许覆盖它（`?fwtest=cidsowned`）
+- 在进度 tab 里打标签要立刻生效，不用刷新页面（`?fwtest=tagclick`，见下）
 
 `?fwtest=<mode>` 是给断言脚本切场景用的：`strip` / `landing` / `scroll` / `legacy` /
-`dupbmk` / `progcleared` / `ratecleared` / `upd` / `crosstab` / `cidsowned`。
+`dupbmk` / `progcleared` / `ratecleared` / `upd` / `crosstab` / `cidsowned` / `tagclick`。
 
 想自己用眼睛看：`python3 test/run-test.py --serve`，浏览器开 <http://127.0.0.1:8899/>，
 可点的地址都列在 <http://127.0.0.1:8899/__routes__>。
@@ -220,6 +221,7 @@ const steps = [['mig1','_mig1'], ['mig2','_mig2'], ['mig3','_mig3'],
 | `_mig4` | 同步配置从「文件路径」推导出「文件夹」 |
 | `_mig5` | 书签改章级后，同一章的多条按新规则再收一次 |
 | `_mig6` | 修被存脏的名字：书名里的页面后缀、章节名里混进的角标 |
+| `_mig7` | 救回「软删了但身上还有东西」的书记录 |
 
 ### 存储层的坑：GM 存储是异步的
 
@@ -257,6 +259,17 @@ const steps = [['mig1','_mig1'], ['mig2','_mig2'], ['mig3','_mig3'],
 
 > 回归测试：`?fwtest=crosstab`（直接改存储假装另一个标签页写过，再触发本页写入），
 > 外加一条静态检查盯住 `_flush()` 里必须有 `mergeStored`。
+
+### 「看得见却改不动」的书记录
+
+`DB.book()` 会**照样返回软删掉的记录**，而 `liveBooks()` 跳过它们。进度 tab 是从
+`prog` 表出发列的，所以一条「书记录软删了、进度还活着」的数据在进度里看得见，
+在书评 tab 里却不出现 —— 于是在进度里给它打标签，看着像没保存。
+（正文页记进度时会顺手救回来，所以刷新一次就「好了」，更难查。）
+
+所以**凡是改内容的入口都走 `DB.editBook(bid)`**（建出来 + 救回来），
+另加 `_mig7` 修存量。回归测试跑在**列表页**上（`/collection/...?fwtest=tagclick`）
+—— 正文页会自愈，测不出问题。
 
 ---
 

@@ -40,6 +40,7 @@ for _i, _a in enumerate(sys.argv):
 TID = '279864'          # 有夹具的那本书
 BOGUS_TID = '280269'    # 用来验 v1.0 假数据迁移
 DONE_TID = '999001'     # 用来验「已完结且读完的书不算在读」
+DROP_TID = '999003'     # 用来验「打了弃坑的书排到进度栏最后、也不查新章」
 # 两个页面数出来的章节数。写死是故意的 —— 夹具一变这条就会红，提醒去核对逻辑。
 #
 # 两者差 1 不是 bug：第 46 章是「单章限制阅读」，**只有书籍详情页列出来**，
@@ -136,6 +137,11 @@ SEED = {
             'id': DONE_TID, 'title': '读完的书', 'url': '', 'tags': [], 'review': '',
             'updatedAt': 1, 'chapTotal': 5, 'done': True, 'chapSeenAt': 1700000000000,
         },
+        # 打了「弃坑」→ 排在进度栏最后，不显示章节进度，也不参与查新章
+        DROP_TID: {
+            'id': DROP_TID, 'title': '弃坑的书', 'url': '', 'tags': ['弃坑'], 'review': '',
+            'updatedAt': 1, 'chapTotal': 9, 'done': False,
+        },
         BOGUS_TID: {
             'id': BOGUS_TID, 'title': '旧版假数据', 'url': '', 'tags': [], 'review': '',
             'updatedAt': 1,
@@ -159,6 +165,12 @@ SEED = {
             'bid': DONE_TID, 'cid': '9001', 'title': '5 最终章',
             'url': '/posts/9001', 'no': 5,
             'pct': 0.99, 'cpct': 0.97, 'anchor': '', 'ts': 1, 'updatedAt': 3000,
+        },
+        # updatedAt 特意给最大：就算「最近才读过」，弃坑了也得排最后
+        DROP_TID: {
+            'bid': DROP_TID, 'cid': '9003', 'title': '3 弃了',
+            'url': '/posts/9003', 'no': 3,
+            'pct': 0.3, 'cpct': 0.3, 'anchor': '', 'ts': 1, 'updatedAt': 9000,
         },
     },
     'chaps': {
@@ -280,11 +292,13 @@ CHECK_JS = r"""
       // 目录页学到的书籍元数据（章节总数 / 完结状态 / 当前章序号）
       learnedTotal: real ? (real.chapTotal || null) : null,
       learnedCids: real ? (real.cids || []) : [],
-      // 正文页面包屑上挂的那个 n/总数
+      // 正文页面包屑上不该再挂角标
       crumbProg: (function () {
         var e = document.querySelector('a[href$="/threads/__TID__/profile"] [data-fw-badge]');
         return e ? e.textContent.trim() : '';
       })(),
+      // 标记条上那个能点的进度小条，整页只该有一条
+      barProgPills: n('[data-fw-bar] [data-fw-jump]'),
       // 列表页的角标自己占两行，不再挤进书名那一行
       listRows: n('[data-fw-rows]'),
       listRowsText: txt('[data-fw-rows]').slice(0, 400),
@@ -355,6 +369,8 @@ CHECK_JS = r"""
       if (progTab) progTab.click();
       r.progText = sr ? ((sr.querySelector('[data-list]') || {}).textContent || '') : '';
       r.progSub = sr ? ((sr.querySelector('.sheet header .sub') || {}).textContent || '') : '';
+      r.progOrder = sr ? [].map.call(sr.querySelectorAll('[data-list] .book'),
+        function (e) { return e.getAttribute('data-bid'); }) : [];
       // 排序验在「书评」tab：默认的「书签」tab 只有一本书有书签，看不出先后。
       // 取书 id 而不是书名 —— 书名会被页面上的真实标题覆盖（noteBook 会更新它）
       var rate = sr ? sr.querySelector('[data-tab="rate"]') : null;
@@ -423,6 +439,33 @@ CHECK_JS = r"""
         r.updCids = (bk.cids || []).length;
         finish();
       }, 5000);
+      return;
+    }
+
+    /* 模式五：在进度 tab 里点标签 —— 要立刻生效，不用刷新页面。 */
+    if (location.search.indexOf('fwtest=tagclick') >= 0) {
+      var h3 = document.getElementById('__fw_marks__');
+      var sr3 = h3 && h3.shadowRoot;
+      var nav3 = document.querySelector('[data-fw-nav] [data-fw-open]');
+      if (nav3) nav3.click();
+      var pt3 = sr3 && sr3.querySelector('[data-tab="prog"]');
+      if (pt3) pt3.click();
+      r.tagProgListed = sr3 ? sr3.querySelectorAll('.book[data-bid="__TID__"]').length : 0;
+      var pen3 = sr3 && sr3.querySelector('[data-pen="__TID__"]');
+      r.tagPen = !!pen3;
+      if (pen3) pen3.click();
+      var chip = sr3 && sr3.querySelector('[data-btag="弃坑"][data-bk="__TID__"]');
+      r.tagChip = !!chip;
+      if (chip) chip.click();
+      setTimeout(function () {
+        var c2 = sr3 && sr3.querySelector('[data-btag="弃坑"][data-bk="__TID__"]');
+        r.tagChipOn = !!(c2 && c2.classList.contains('on'));
+        r.tagInStore = (((db().books || {})['__TID__'] || {}).tags || []).indexOf('弃坑') >= 0;
+        var rt = sr3 && sr3.querySelector('[data-tab="rate"]');
+        if (rt) rt.click();
+        r.tagRateListed = sr3 ? sr3.querySelectorAll('.book[data-bid="__TID__"]').length : 0;
+        finish();
+      }, 600);
       return;
     }
 
@@ -531,6 +574,15 @@ def inject_html(html, query=''):
         later.update({'key': f'{TID}|{PIDS[1]}-999',
                       'createdAt': 9999, 'updatedAt': 9999})
         data['bmks'][f'{TID}|{PIDS[1]}-999'] = later
+
+    elif 'fwtest=tagclick' in query:
+        # 书记录被软删过、但进度还活着（老数据里真实存在这种）。
+        # 进度 tab 靠 prog 表列，所以看得见；而书评 tab 走 liveBooks()，就看不见 ——
+        # 在进度里给它打标签之后，两边都得立刻跟上，不该要刷新页面
+        data = json.loads(json.dumps(SEED))
+        data['books'][TID]['deleted'] = True
+        data['books'][TID]['tags'] = []
+        data['books'][TID]['review'] = ''
 
     elif 'fwtest=cidsowned' in query:
         # 已经从详情页学过章节列表了 → 目录列表页不许再去覆盖它
@@ -816,10 +868,23 @@ def main():
              and len(r.get('learnedCids') or []) == CHAP_TOTAL_PROFILE),
             ('读完的书归到「读完了」',  lambda r: '读完了' in r.get('progText', '')
              and '✓ 读完' in r.get('progText', '')),
-            # 种子里 3 本有进度：TID 和 UPD_TID 在读、DONE_TID 已读完
-            ('在读算 2 本、读完 1 本', lambda r: '2 本在读' in r.get('progSub', '')
-             and '1 本读完' in r.get('progSub', '')),
+            # 种子里 4 本有进度：TID / UPD_TID 在读，DONE_TID 读完，DROP_TID 弃坑
+            ('在读算 2 本', lambda r: '2 本在读' in r.get('progSub', '')),
             ('进度 tab 里书名后也有铅笔', lambda r: '✏️' in r.get('progText', '')),
+            # 弃坑的排最后（即使它 updatedAt 最大），读完的排在它前面
+            ('弃坑的排在进度栏最后',
+             lambda r: (r.get('progOrder') or [None])[-1] == DROP_TID),
+            ('读完的排在弃坑之前',
+             lambda r: (r.get('progOrder') or []).index(DONE_TID)
+             < (r.get('progOrder') or []).index(DROP_TID)),
+            ('读完 / 弃坑 不显示章节进度',
+             lambda r: '5/5' not in r.get('progText', '')
+             and '3/9' not in r.get('progText', '')),
+            ('分组计数写全了',         lambda r: '1 本读完' in r.get('progSub', '')
+             and '1 本弃坑' in r.get('progSub', '')),
+            ('「已读完」按钮文案就叫已读完',
+             lambda r: '已读完' in r.get('progText', '')
+             and '标已读完' not in r.get('progText', '')),
             ('最近读的书排在列表最前', lambda r: (r.get('allListOrder') or [None])[0] == TID),
             ('书评 tab 列出了多本书（排序才有意义）',
              lambda r: len(r.get('allListOrder') or []) >= 2),
@@ -883,8 +948,9 @@ def main():
             ('已标章节高亮正确',       lambda r: '精彩' in r['barsText'] and '跳过' in r['barsText']),
             # 「读到哪一章」由面包屑上那个进度小条说明，标记条上不再写红字
             ('标记条上没有「读到这里」红字', lambda r: '读到这里' not in r['barsText']),
-            ('面包屑上挂了 n/总数 的进度', lambda r: '/' in r['crumbProg']
-             or r['crumbProg'] == '已记下'),
+            # 进度小条挪到标记条上、书签钮后面了（面包屑是网站自己的东西，不去挤）
+            ('面包屑上不挂进度了',     lambda r: r['crumbProg'] == ''),
+            ('标记条上只挂一条进度小条', lambda r: r['barProgPills'] == 1),
             # 书签钮只留图标，不写字（标了是亮的、没标是灰的）
             ('书签钮只有图标、没有文字', lambda r: '🔖' in r['barsText']
              and '书签' not in r['barsText']),
@@ -931,6 +997,23 @@ def main():
              and r.get('updCids') == CHAP_TOTAL_PROFILE),
             ('记下了这次查过的时间', lambda r: (r.get('updCheckedAt') or 0) > 1),
             ('没有 JS 报错',        lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}?fwtest=tagclick', '进度 tab 里打标签 → 立刻生效', [
+            ('进度 tab 列出了这本',   lambda r: r.get('tagProgListed') == 1),
+            ('书名后有铅笔',          lambda r: r.get('tagPen') is True),
+            ('编辑块里有标签格子',    lambda r: r.get('tagChip') is True),
+            ('点完标签真写进存储了',  lambda r: r.get('tagInStore') is True),
+            ('格子立刻变成选中态',    lambda r: r.get('tagChipOn') is True),
+            ('书评 tab 立刻也列出来了', lambda r: r.get('tagRateListed') == 1),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/collection/{UID}?fwtest=tagclick',
+         '进度 tab 里打标签（书记录被软删过、且这一页不会自愈）', [
+            ('进度 tab 列出了这本',   lambda r: r.get('tagProgListed') == 1),
+            ('点完标签真写进存储了',  lambda r: r.get('tagInStore') is True),
+            ('格子立刻变成选中态',    lambda r: r.get('tagChipOn') is True),
+            ('书评 tab 立刻也列出来了', lambda r: r.get('tagRateListed') == 1),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}?fwtest=crosstab', '两个标签页同时写 → 不许互相冲掉', [
             ('确实触发了本页的写入', lambda r: r.get('crossTriggered') is True),
