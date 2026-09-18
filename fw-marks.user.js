@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.12.0
+// @version      1.12.1
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1822,7 +1822,7 @@
         ${rvBoxHTML(b)}
         <div class="btns" style="margin-top:8px">
           <button class="btn sm" data-jump="${esc(p.url || '')}">继续读</button>
-          <button class="btn g sm" data-jump="${esc(DB.bookUrl(b.id))}">书籍主页</button>
+          <button class="btn g sm" data-jump="${esc(DB.bookUrl(b.id))}">去目录</button>
           <button class="btn g sm" data-doneread="${esc(b.id)}"
             data-on="${b.doneRead ? '1' : ''}">${b.doneRead ? '↩ 没读完' : '✓ 标已读完'}</button>
           <button class="btn g sm" data-progdel="${esc(b.id)}">清除进度</button>
@@ -1890,7 +1890,7 @@
         ${rvTextHTML(b)}
         ${rvBoxHTML(b)}
         <div class="btns" style="margin-top:8px">
-          <button class="btn g sm" data-jump="${esc(DB.bookUrl(b.id))}">书籍主页</button>
+          <button class="btn g sm" data-jump="${esc(DB.bookUrl(b.id))}">去目录</button>
           ${cs.length ? `<button class="btn g sm" data-toggle>标记章节 ${cs.length}</button>` : ''}
           <button class="btn g sm" data-ratedel="${esc(b.id)}">清除书评</button>
         </div>
