@@ -43,7 +43,7 @@ DONE_TID = '999001'     # 用来验「已完结且读完的书不算在读」
 # chapter_index.html 夹具里去重后的章节数。写死是故意的 ——
 # 夹具一变这条就会红，提醒去核对去重逻辑（原始链接有 138 条，含手机/桌面两份目录）
 CHAP_TOTAL = 46
-UPD_TID = '999002'      # 用来验「后台自己查新章」：种子里故意只记 3 章
+UPD_TID = '999002'      # 用来验「手动查新章」：种子里故意只记 3 章
 # thread.html 里那 6 章（按出现顺序）
 PIDS = ['15749637', '15771234', '15776844', '15781781', '15787165', '15794090']
 PID_PROGRESS = PIDS[0]  # 进度指向第一章 —— post.html 夹具正好是这一章，跳转落地能验
@@ -123,7 +123,7 @@ SEED = {
             'tags': ['追更中', '甜文'], 'review': '总评测试', 'updatedAt': 1,
             'chapTotal': 46, 'done': False, 'chapSeenAt': 1700000000000,
         },
-        # 章节数过时（只记了 3 章）且很久没查过 → 后台应该去抓一次目录页更新它
+        # 章节数过时（只记了 3 章）→ 点「查新章」应该去抓一次目录页更新它
         UPD_TID: {
             'id': UPD_TID, 'title': '待查新章的书', 'url': '', 'tags': [], 'review': '',
             'updatedAt': 1, 'chapTotal': 3, 'done': False, 'chapCheckedAt': 1,
@@ -240,7 +240,7 @@ CHECK_JS = r"""
       navEntry: n('[data-fw-nav] [data-fw-open]'),
       navText: txt('[data-fw-nav]'),
       pageActions: n('[data-fw-actions] [data-fw-open]'),
-      // 悬浮球必须彻底没有了（它会压住网站自己的按钮）
+      // 悬浮球必须彻底没有了 —— 它会压住网站自己的按钮
       fabLeft: (function () {
         var h = document.getElementById('__fw_marks__');
         return h && h.shadowRoot ? h.shadowRoot.querySelectorAll('.fab').length : -1;
@@ -283,8 +283,8 @@ CHECK_JS = r"""
       progLeftInBook: real ? !!real.progress : null,
       progBogusMoved: !!(d.prog || {})['__BOGUS__'],
 
-      // 悬浮球有没有把页面上的链接盖住 —— 盖住了的话真站上也会「点不了」。
-      // elementFromPoint 是唯一靠谱的判法：光看 CSS 说 display:none 不算数。
+      // 有没有哪个部件把页面上的链接盖住了 —— 盖住了真站上也会「点不了」。
+      // elementFromPoint 是唯一靠谱的判法，光看 CSS 说 display:none 不算数
       blockedLinks: (function () {
         var bad = [], as = document.querySelectorAll('a[href]');
         for (var i = 0; i < as.length && bad.length < 4; i++) {
@@ -325,7 +325,7 @@ CHECK_JS = r"""
       })(),
     };
 
-    // 点顶栏那一项，面板得真的打开（没了悬浮球，这就是唯一的全站入口）
+    // 点顶栏那一项，面板得真的打开 —— 这是唯一的全站入口
     (function () {
       var a = document.querySelector('[data-fw-nav] [data-fw-open]');
       if (!a) { r.navOpens = null; return; }
@@ -523,7 +523,7 @@ def inject_html(html, query=''):
         data['prog'][TID]['deleted'] = True
 
     elif 'fwtest=ratecleared' in query:
-        # 点了「清除评价」——标签/总评/章节标记都清掉，
+        # 点了「清除书评」——标签、书评、章节标记都清掉，
         # 但**书签和进度必须还在**（三者互相独立）
         data = json.loads(json.dumps(SEED))
         data['books'][TID]['tags'] = []
@@ -821,7 +821,7 @@ def main():
             ('书名后也不挂 ▶ 进度',   lambda r: '▶' not in r['badgeText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
-        (f'/threads/{TID}/profile?fwtest=ratecleared', '清除评价 → 书签和进度必须还在', [
+        (f'/threads/{TID}/profile?fwtest=ratecleared', '清除书评 → 书签和进度必须还在', [
             ('进度提示条还在',         lambda r: r['strips'] == 1),
             ('书名后还挂着 ▶ 进度',    lambda r: '▶' in r['badgeText']),
             ('书签角标还在',           lambda r: '🔖' in r['badgeText']),
@@ -829,7 +829,8 @@ def main():
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}/chapter_index', '纯目录列表页', [
-            # 章节总数只认这一页：介绍页里嵌的目录实测会多算一条
+            # 介绍页那份实测 = 这一页 + 末尾几章，所以脚本取两者较大值；
+            # 这一页学到的必须正好等于去重后的章节数
             ('学到的章节总数 = 目录里去重后的章节数',
              lambda r: r.get('learnedTotal') == CHAP_TOTAL),
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
