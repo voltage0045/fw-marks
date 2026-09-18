@@ -40,9 +40,12 @@ for _i, _a in enumerate(sys.argv):
 TID = '279864'          # 有夹具的那本书
 BOGUS_TID = '280269'    # 用来验 v1.0 假数据迁移
 DONE_TID = '999001'     # 用来验「已完结且读完的书不算在读」
-# chapter_index.html 夹具里去重后的章节数。写死是故意的 ——
-# 夹具一变这条就会红，提醒去核对去重逻辑（原始链接有 138 条，含手机/桌面两份目录）
-CHAP_TOTAL = 46
+# 两个页面数出来的章节数。写死是故意的 —— 夹具一变这条就会红，提醒去核对逻辑。
+#
+# 两者差 1 不是 bug：第 46 章是「单章限制阅读」，**只有书籍详情页列出来**，
+# 目录列表页把它漏掉了。所以脚本以详情页为准（见 learnBookMeta / fetchCids）。
+CHAP_TOTAL = 46          # /chapter_index 去重后
+CHAP_TOTAL_PROFILE = 47  # /profile 去重后（权威值）
 UPD_TID = '999002'      # 用来验「手动查新章」：种子里故意只记 3 章
 # thread.html 里那 6 章（按出现顺序）
 PIDS = ['15749637', '15771234', '15776844', '15781781', '15787165', '15794090']
@@ -276,6 +279,17 @@ CHECK_JS = r"""
       migRealKept: real ? !real.deleted : null,
       // 目录页学到的书籍元数据（章节总数 / 完结状态 / 当前章序号）
       learnedTotal: real ? (real.chapTotal || null) : null,
+      learnedCids: real ? (real.cids || []) : [],
+      // 正文页面包屑上挂的那个 n/总数
+      crumbProg: (function () {
+        var e = document.querySelector('a[href$="/threads/__TID__/profile"] [data-fw-badge]');
+        return e ? e.textContent.trim() : '';
+      })(),
+      // 列表页的角标自己占两行，不再挤进书名那一行
+      listRows: n('[data-fw-rows]'),
+      listRowsText: txt('[data-fw-rows]').slice(0, 400),
+      // 书名那个 <a> 里面不许再有角标（会把标题挤走）
+      titleBadges: n('a[href*="/threads/"] > [data-fw-badge]'),
       learnedDone: real ? (real.done === undefined ? null : real.done) : null,
       learnedNo: ((d.prog || {})['__TID__'] || {}).no || null,
       // v1.5：进度搬进独立的 prog 表，书记录里那个字段要消失
@@ -336,7 +350,7 @@ CHECK_JS = r"""
       r.navOpens = !!(sh && sh.classList.contains('on'));
       // 三个 subtab 都该存在
       r.tabCount = sr ? sr.querySelectorAll('.tabs [data-tab]').length : 0;
-      // 进度 tab：验 19/46 这种显示、有新章标记、以及读完的书被分出去
+      // 进度 tab：验「第几章/共几章」、有新章标记、以及读完的书被分出去
       var progTab = sr ? sr.querySelector('[data-tab="prog"]') : null;
       if (progTab) progTab.click();
       r.progText = sr ? ((sr.querySelector('[data-list]') || {}).textContent || '') : '';
@@ -406,6 +420,7 @@ CHECK_JS = r"""
         var bk = (db().books || {})['__UPD__'] || {};
         r.updTotal = bk.chapTotal || null;
         r.updCheckedAt = bk.chapCheckedAt || null;
+        r.updCids = (bk.cids || []).length;
         finish();
       }, 5000);
       return;
@@ -516,6 +531,13 @@ def inject_html(html, query=''):
         later.update({'key': f'{TID}|{PIDS[1]}-999',
                       'createdAt': 9999, 'updatedAt': 9999})
         data['bmks'][f'{TID}|{PIDS[1]}-999'] = later
+
+    elif 'fwtest=cidsowned' in query:
+        # 已经从详情页学过章节列表了 → 目录列表页不许再去覆盖它
+        # （详情页是权威来源，列表页会漏掉「限阅」那种章节）
+        data = json.loads(json.dumps(SEED))
+        data['books'][TID]['cids'] = PIDS[:3]
+        data['books'][TID]['chapTotal'] = 3
 
     elif 'fwtest=progcleared' in query:
         # 在「我的标记 → 进度」里点了「清除进度」之后，详情页不该还显示「上次读到」
@@ -789,6 +811,9 @@ def main():
              lambda r: re.search(r'\d+/\d+', r.get('progText', '')) is not None),
             ('有新章会标出来',         lambda r: '有新章' in r.get('progText', '')),
             ('介绍页也能学到连载状态', lambda r: r.get('learnedDone') is False),
+            ('介绍页是章节数的权威来源（含限阅那一章）',
+             lambda r: r.get('learnedTotal') == CHAP_TOTAL_PROFILE
+             and len(r.get('learnedCids') or []) == CHAP_TOTAL_PROFILE),
             ('读完的书归到「读完了」',  lambda r: '读完了' in r.get('progText', '')
              and '✓ 读完' in r.get('progText', '')),
             # 种子里 3 本有进度：TID 和 UPD_TID 在读、DONE_TID 已读完
@@ -810,6 +835,18 @@ def main():
             ('页面链接没被挡住',       lambda r: not r['blockedLinks']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
+        (f'/threads/{TID}/chapter_index?fwtest=cidsowned',
+         '详情页学过之后 → 目录列表页不许覆盖', [
+            ('章节数还是详情页那份', lambda r: r.get('learnedTotal') == 3
+             and len(r.get('learnedCids') or []) == 3),
+            ('没有 JS 报错',        lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=cidsowned',
+         '详情页自己则一律重新学', [
+            ('详情页会把章节数改成自己数出来的',
+             lambda r: r.get('learnedTotal') == CHAP_TOTAL_PROFILE),
+            ('没有 JS 报错',        lambda r: not r['jsErrors']),
+        ]),
         (f'/threads/{TID}/profile?fwtest=dupbmk', '跨设备重复书签 → 合并后要去重', [
             ('同一位置只剩一条书签',   lambda r: r.get('dupLive') == 1),
             ('留下的是先创建的那条（确定性）',
@@ -829,9 +866,8 @@ def main():
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}/chapter_index', '纯目录列表页', [
-            # 介绍页那份实测 = 这一页 + 末尾几章，所以脚本取两者较大值；
-            # 这一页学到的必须正好等于去重后的章节数
-            ('学到的章节总数 = 目录里去重后的章节数',
+            # 还没从详情页学过时，这一页兜底，学到的就是它自己去重后的章节数
+            ('没学过时目录列表页兜底',
              lambda r: r.get('learnedTotal') == CHAP_TOTAL),
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
             ('也认成了目录页',         lambda r: r['badges'] >= 3),
@@ -845,7 +881,10 @@ def main():
             ('标记条上有三个标签钮',   lambda r: r['markBtns'] == len(PIDS) * 3),
             (f'每章都有书签钮',        lambda r: r['bmkBtns'] == len(PIDS)),
             ('已标章节高亮正确',       lambda r: '精彩' in r['barsText'] and '跳过' in r['barsText']),
-            ('标出了「读到这里」',     lambda r: '读到这里' in r['barsText']),
+            # 「读到哪一章」由面包屑上那个进度小条说明，标记条上不再写红字
+            ('标记条上没有「读到这里」红字', lambda r: '读到这里' not in r['barsText']),
+            ('面包屑上挂了 n/总数 的进度', lambda r: '/' in r['crumbProg']
+             or r['crumbProg'] == '已记下'),
             # 书签钮只留图标，不写字（标了是亮的、没标是灰的）
             ('书签钮只有图标、没有文字', lambda r: '🔖' in r['barsText']
              and '书签' not in r['barsText']),
@@ -887,7 +926,9 @@ def main():
         (f'/threads/{TID}?fwtest=upd', '手动查新章（不用点开每本书）', [
             ('没点之前不后台偷查',   lambda r: r.get('updBefore') == 3),
             ('进度 tab 里有「查新章」按钮', lambda r: r.get('updBtn') is True),
-            ('点了之后过时的章节数被更新了', lambda r: r.get('updTotal') == CHAP_TOTAL),
+            ('点了之后章节数被更新成详情页那份',
+             lambda r: r.get('updTotal') == CHAP_TOTAL_PROFILE
+             and r.get('updCids') == CHAP_TOTAL_PROFILE),
             ('记下了这次查过的时间', lambda r: (r.get('updCheckedAt') or 0) > 1),
             ('没有 JS 报错',        lambda r: not r['jsErrors']),
         ]),
@@ -905,9 +946,11 @@ def main():
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         ('/books?fwtest=legacy', '文库页 + v1.0 假数据迁移', [
-            ('书名后挂了标签',         lambda r: r['bookItemBadge'] >= 1),
-            ('标签内容正确',           lambda r: '追更中' in r['badgeText'] and '▶' in r['badgeText']),
-            ('书名后显示书签数 🔖2',   lambda r: '🔖2' in r['badgeText']),
+            ('角标另起两行、没挤进书名', lambda r: r['listRows'] >= 1
+             and r['titleBadges'] == 0),
+            ('标签和进度都画上了',     lambda r: '追更中' in r['listRowsText']
+             and '▶' in r['listRowsText']),
+            ('显示书签数 🔖2',         lambda r: '🔖2' in r['listRowsText']),
             ('两步迁移都跑过了',       lambda r: r['migFlag'] and r['migProgressCleared']),
             ('假章节记录已软删',       lambda r: r['migChapDeleted']),
             ('空壳假书已软删',         lambda r: r['migBookDeleted']),
@@ -916,12 +959,13 @@ def main():
              lambda r: (r.get('progTable') or {}).get('cid') == PID_PROGRESS),
             ('书记录里不再残留 progress', lambda r: r.get('progLeftInBook') is False),
             ('假进度没被搬进新表（先被清掉了）', lambda r: r.get('progBogusMoved') is False),
-            ('假书不再显示 ▶ 进度',    lambda r: '旧版假数据' not in r['badgeText']),
+            ('假书不再显示 ▶ 进度',    lambda r: '旧版假数据' not in r['listRowsText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/collection/{UID}', '收藏页', [
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
-            ('书名后挂上了标签',       lambda r: r['badges'] >= 1 and '列表验证' in r['badgeText']),
+            ('标签画在自己那一行上',   lambda r: r['listRows'] >= 1
+             and '列表验证' in r['listRowsText'] and r['titleBadges'] == 0),
             ('页面链接一个都没被挡住', lambda r: not r['blockedLinks']),
             ('子 tab 点得到',          lambda r: r['tabReachable'] is True),
             ('点顶栏入口能打开面板',   lambda r: r['navOpens'] is True),
@@ -929,17 +973,22 @@ def main():
         ]),
         ('/', '首页', [
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
-            ('书名后挂上了标签',       lambda r: r['badges'] >= 1 and '列表验证' in r['badgeText']),
+            # 首页的「推荐」是一行一本的紧凑列表，没有 article 条目可以插行 ——
+            # 这种页面就退回把小角标挂在书名后面，不强求另起两行
+            ('退回挂在书名后（没有 article 条目）',
+             lambda r: r['titleBadges'] >= 1 and '列表验证' in r['badgeText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         ('/channels/1', '频道页', [
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
-            ('书名后挂上了标签',       lambda r: r['badges'] >= 1 and '列表验证' in r['badgeText']),
+            ('标签画在自己那一行上',   lambda r: r['listRows'] >= 1
+             and '列表验证' in r['listRowsText'] and r['titleBadges'] == 0),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         ('/thread_index', '主题索引页', [
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
-            ('书名后挂上了标签',       lambda r: r['badges'] >= 1 and '列表验证' in r['badgeText']),
+            ('标签画在自己那一行上',   lambda r: r['listRows'] >= 1
+             and '列表验证' in r['listRowsText'] and r['titleBadges'] == 0),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         ('/status_collection', '动态页', [
@@ -987,9 +1036,13 @@ def main():
             passed += bool(ok)
             if not ok:
                 failed_cases.append(f'{label} / {name}')
+                if os.environ.get('FW_DEBUG'):
+                    print('     debug:', json.dumps({k:r.get(k) for k in ('crumbProg','listRows','listRowsText','titleBadges','badgeText')}, ensure_ascii=False)[:500])
             print(f'  {"✅" if ok else "❌"} {name}')
         if r['jsErrors']:
             print('   JS 报错：', r['jsErrors'])
+        if os.environ.get('FW_CIDS'):
+            print('   CIDS:', ','.join(r.get('learnedCids') or []))
         if r.get('learnedTotal') is not None:
             print(f"   学到：章节总数={r.get('learnedTotal')} "
                   f"完结={r.get('learnedDone')} 当前章={r.get('learnedNo')}")
