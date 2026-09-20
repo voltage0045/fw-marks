@@ -299,11 +299,20 @@ CHECK_JS = r"""
       })(),
       // 标记条上那个能点的进度小条，整页只该有一条
       barProgPills: n('[data-fw-bar] [data-fw-jump]'),
-      // 列表页的角标自己占两行，不再挤进书名那一行
+      // 最后一章正文末尾那个「我读完了」
+      endBtns: n('[data-fw-end]'),
+      endText: txt('[data-fw-end]').slice(0, 120),
+      // 列表页：进度单独占一行、靠右；标签这些短的还是挂书名后
       listRows: n('[data-fw-rows]'),
       listRowsText: txt('[data-fw-rows]').slice(0, 400),
-      // 书名那个 <a> 里面不许再有角标（会把标题挤走）
+      listRowsAlign: (function () {
+        var e = document.querySelector('[data-fw-rows]');
+        return e ? getComputedStyle(e).textAlign : '';
+      })(),
       titleBadges: n('a[href*="/threads/"] > [data-fw-badge]'),
+      // 详情页：角标挂在站点那排标签的下一行
+      metaBox: n('[data-fw-meta]'),
+      metaText: txt('[data-fw-meta]').slice(0, 300),
       learnedDone: real ? (real.done === undefined ? null : real.done) : null,
       learnedNo: ((d.prog || {})['__TID__'] || {}).no || null,
       // v1.5：进度搬进独立的 prog 表，书记录里那个字段要消失
@@ -381,6 +390,7 @@ CHECK_JS = r"""
         : [];
       // 写好的书评是纯文本，不是一直摆着的输入框；铅笔点开才有输入框
       r.rateRvText = sr ? ((sr.querySelector('.book .rv') || {}).textContent || '') : '';
+      r.rateFirstTitle = sr ? ((sr.querySelector('.book .bt') || {}).textContent || '') : '';
       r.rateTextareas = sr ? sr.querySelectorAll('.rvedit').length : 0;
       r.ratePens = sr ? sr.querySelectorAll('[data-pen]').length : 0;
       var pen = sr ? sr.querySelector('[data-pen]') : null;
@@ -574,6 +584,13 @@ def inject_html(html, query=''):
         later.update({'key': f'{TID}|{PIDS[1]}-999',
                       'createdAt': 9999, 'updatedAt': 9999})
         data['bmks'][f'{TID}|{PIDS[1]}-999'] = later
+
+    elif 'fwtest=lastchap' in query:
+        # 让本页最后一章正好是全书最后一章 → 该冒出「✓ 我读完了」
+        data = json.loads(json.dumps(SEED))
+        data['books'][TID]['cids'] = PIDS
+        data['books'][TID]['chapTotal'] = len(PIDS)
+        data['books'][TID]['doneRead'] = False
 
     elif 'fwtest=tagclick' in query:
         # 书记录被软删过、但进度还活着（老数据里真实存在这种）。
@@ -850,8 +867,11 @@ def main():
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
             ('目录角标画出来了',       lambda r: r['badges'] >= 3),
             ('角标里有章节标签',       lambda r: '精彩' in r['badgeText'] and '跳过' in r['badgeText']),
-            ('书名后挂了书籍标签',     lambda r: r['crumbBadge'] >= 1 and '追更中' in r['badgeText']),
-            ('书名后显示书签数 🔖2',   lambda r: '🔖2' in r['badgeText']),
+            # 角标挪到站点那排标签的下一行了，面包屑和大标题都不挂
+            ('角标挂在站点标签的下一行', lambda r: r['metaBox'] == 1
+             and '追更中' in r['metaText']),
+            ('面包屑和大标题都不挂角标', lambda r: r['crumbBadge'] == 0),
+            ('那一行里有书签数 🔖2',   lambda r: '🔖2' in r['metaText']),
             ('有书签的章节挂了 🔖',    lambda r: '🔖' in r['badgeText']),
             ('有「上次读到」提示条',   lambda r: r['strips'] == 1 and '上次读到' in r['stripText']),
             ('书签没有「改名」按钮',   lambda r: r['renameBtns'] == 0),
@@ -894,6 +914,10 @@ def main():
             ('写好的书评显示成文本',   lambda r: '总评测试' in r.get('rateRvText', '')),
             ('没点铅笔时不摆输入框',   lambda r: r.get('rateTextareas') == 0),
             ('每本书名后都有铅笔',     lambda r: (r.get('ratePens') or 0) >= 1),
+            # 书评 tab 的书名后也标一下进度
+            ('书评 tab 书名后标了进度',
+             lambda r: re.search(r'\d+/\d+|读完|在读|弃坑',
+                                 r.get('rateFirstTitle', '')) is not None),
             ('点铅笔就展开书评框 + 标签',
              lambda r: r.get('penBoxes') == 1 and (r.get('penTags') or 0) >= 1),
             ('书名后的进度条能点着跳', lambda r: (r.get('jumpPills') or 0) >= 1),
@@ -1015,6 +1039,13 @@ def main():
             ('书评 tab 立刻也列出来了', lambda r: r.get('tagRateListed') == 1),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
+        (f'/threads/{TID}?fwtest=lastchap', '最后一章 → 正文末尾也有「我读完了」', [
+            ('标记条上有一个',       lambda r: '我读完了' in r['barsText']),
+            ('正文末尾也有一个',     lambda r: r.get('endBtns') == 1
+             and '我读完了' in r.get('endText', '')),
+            ('只有最后那一章有',     lambda r: r['barsText'].count('我读完了') == 1),
+            ('没有 JS 报错',        lambda r: not r['jsErrors']),
+        ]),
         (f'/threads/{TID}?fwtest=crosstab', '两个标签页同时写 → 不许互相冲掉', [
             ('确实触发了本页的写入', lambda r: r.get('crossTriggered') is True),
             ('另一个标签页刚记的进度还在',
@@ -1029,11 +1060,12 @@ def main():
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         ('/books?fwtest=legacy', '文库页 + v1.0 假数据迁移', [
-            ('角标另起两行、没挤进书名', lambda r: r['listRows'] >= 1
-             and r['titleBadges'] == 0),
-            ('标签和进度都画上了',     lambda r: '追更中' in r['listRowsText']
-             and '▶' in r['listRowsText']),
-            ('显示书签数 🔖2',         lambda r: '🔖2' in r['listRowsText']),
+            ('进度单独占一行、靠右',   lambda r: r['listRows'] >= 1
+             and '▶' in r['listRowsText'] and r['listRowsAlign'] == 'right'),
+            ('标签还是挂在书名后',     lambda r: r['titleBadges'] >= 1
+             and '追更中' in r['badgeText']),
+            ('那一行里不重复挂进度',   lambda r: '▶' not in r['badgeText']),
+            ('显示书签数 🔖2',         lambda r: '🔖2' in r['badgeText']),
             ('两步迁移都跑过了',       lambda r: r['migFlag'] and r['migProgressCleared']),
             ('假章节记录已软删',       lambda r: r['migChapDeleted']),
             ('空壳假书已软删',         lambda r: r['migBookDeleted']),
@@ -1042,13 +1074,14 @@ def main():
              lambda r: (r.get('progTable') or {}).get('cid') == PID_PROGRESS),
             ('书记录里不再残留 progress', lambda r: r.get('progLeftInBook') is False),
             ('假进度没被搬进新表（先被清掉了）', lambda r: r.get('progBogusMoved') is False),
-            ('假书不再显示 ▶ 进度',    lambda r: '旧版假数据' not in r['listRowsText']),
+            ('假书不再显示 ▶ 进度',    lambda r: '旧版假数据' not in r['listRowsText']
+             and '旧版假数据' not in r['badgeText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/collection/{UID}', '收藏页', [
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
-            ('标签画在自己那一行上',   lambda r: r['listRows'] >= 1
-             and '列表验证' in r['listRowsText'] and r['titleBadges'] == 0),
+            ('标签挂在书名后',         lambda r: r['titleBadges'] >= 1
+             and '列表验证' in r['badgeText']),
             ('页面链接一个都没被挡住', lambda r: not r['blockedLinks']),
             ('子 tab 点得到',          lambda r: r['tabReachable'] is True),
             ('点顶栏入口能打开面板',   lambda r: r['navOpens'] is True),
@@ -1064,14 +1097,14 @@ def main():
         ]),
         ('/channels/1', '频道页', [
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
-            ('标签画在自己那一行上',   lambda r: r['listRows'] >= 1
-             and '列表验证' in r['listRowsText'] and r['titleBadges'] == 0),
+            ('标签挂在书名后',         lambda r: r['titleBadges'] >= 1
+             and '列表验证' in r['badgeText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         ('/thread_index', '主题索引页', [
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
-            ('标签画在自己那一行上',   lambda r: r['listRows'] >= 1
-             and '列表验证' in r['listRowsText'] and r['titleBadges'] == 0),
+            ('标签挂在书名后',         lambda r: r['titleBadges'] >= 1
+             and '列表验证' in r['badgeText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         ('/status_collection', '动态页', [

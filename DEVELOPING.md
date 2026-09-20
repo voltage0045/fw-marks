@@ -38,7 +38,7 @@ python3 test/run-test.py
 
 === 单章固定链接页 ===           === 收藏 / 首页 / 频道 / 索引 ===
   ✅ 只认出 1 章（回帖没被算进来） ✅ 书名后挂上了标签
-150/150 通过
+162/162 通过
 ```
 
 覆盖的页面：首页、收藏、文库、书籍介绍、纯目录列表、正文、单章固定链接、
@@ -57,7 +57,7 @@ python3 test/run-test.py
 - 在进度 tab 里打标签要立刻生效，不用刷新页面（`?fwtest=tagclick`，见下）
 
 `?fwtest=<mode>` 是给断言脚本切场景用的：`strip` / `landing` / `scroll` / `legacy` /
-`dupbmk` / `progcleared` / `ratecleared` / `upd` / `crosstab` / `cidsowned` / `tagclick`。
+`dupbmk` / `progcleared` / `ratecleared` / `upd` / `crosstab` / `cidsowned` / `tagclick` / `lastchap`。
 
 想自己用眼睛看：`python3 test/run-test.py --serve`，浏览器开 <http://127.0.0.1:8899/>，
 可点的地址都列在 <http://127.0.0.1:8899/__routes__>。
@@ -208,10 +208,11 @@ COLLECTIONS = ['books', 'chaps', 'bmks', 'prog']
 
 ```js
 const steps = [['mig1','_mig1'], ['mig2','_mig2'], ['mig3','_mig3'],
-               ['mig4','_mig4'], ['mig5','_mig5']];
+               ['mig4','_mig4'], ['mig5','_mig5'], ['mig6','_mig6'],
+               ['mig7','_mig7']];
 ```
 
-一条一条叠加、各有独立完成标记，以后改结构就加 `_mig6` 并补一行。顺序有意义。
+一条一条叠加、各有独立完成标记，以后改结构就加 `_mig8` 并补一行。顺序有意义。
 
 | 步 | 做什么 |
 |---|---|

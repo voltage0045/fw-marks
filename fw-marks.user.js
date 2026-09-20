@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.12.2
+// @version      1.13.0
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1799,6 +1799,16 @@
   const tagPills = (b) => (b.tags || [])
     .map((t) => `<span class="pill" style="background:#5a6b8c">${esc(t)}</span>`).join('');
 
+  // 书名后那个进度小标：收尾了就一个词，在读的给「第几章/共几章」
+  function progTagHTML(b) {
+    if (!DB.prog(b.id)) return '';
+    const p = DB.prog(b.id);
+    if (DB.isDropped(b.id)) return `<span class="pill" style="background:#9aa0a6">${DROP_TAG}</span>`;
+    if (DB.isFinished(b.id)) return '<span class="pill" style="background:#34a853">读完</span>';
+    const txt = p.no && b.chapTotal ? `${p.no}/${b.chapTotal}` : '在读';
+    return `<span class="pill" style="background:#5a6b8c">${txt}</span>`;
+  }
+
   // ---- tab 1：书签 ----
   function paintBmkTab(box, kw) {
     const rows = [];
@@ -1932,6 +1942,7 @@
       // 想改再点铅笔 —— 一直摆个输入框在那儿，列表全是框，读起来累
       rows.push(`<div class="book" data-bid="${esc(b.id)}">
         <div class="bt">${bookName(b)}
+          ${progTagHTML(b)}
           ${tagPills(b)}
           ${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) =>
             `<span class="pill" style="background:${MARKS[k].color}">${MARKS[k].label} ${v}</span>`).join('')}
@@ -2532,10 +2543,11 @@
       : (no ? '第 ' + no + ' 章' : '已记下'));
   }
 
-  // 书籍角标：自定义标签 + 读到哪 + 标了几章 + 有书评
-  function bookBadgeHTML(b) {
+  // 书籍角标：自定义标签 + 读到哪 + 标了几章 + 有书评。
+  // noProg：进度已经在别处单独占一行了（列表页），这儿就别再挂一份
+  function bookBadgeHTML(b, noProg) {
     if (!b || b.deleted) return '';
-    const bp = DB.prog(b.id);
+    const bp = noProg ? null : DB.prog(b.id);
     const tags = (b.tags || []).map((t) => pill('#5a6b8c', esc(t))).join('');
     const prog = bp ? progPill(b.id, '▶ ' + (bp.title || '读过')) : '';
     const n = idx().markedCount(b.id);
@@ -2790,14 +2802,38 @@
     return document.querySelector('.panel-body') || null;
   }
 
+  // 站点自己那排书籍标签（原创小说 – BL – 完结 – …）所在的那一行
+  function siteTagLine() {
+    const as = document.querySelectorAll('.article-body a[href*="/tag/"]');
+    const a = as[as.length - 1];
+    return a ? a.closest('div') : null;
+  }
+
   function paintProfile() {
     if (Page.type !== 'catalog' || !Page.bid) return;
     const b = DB.book(Page.bid, false);
 
-    // 书名在这一页会出现两次（面包屑里和大标题里），两处都挂
+    /*
+     * 角标挂在**站点自己那排标签的下一行**，不挂面包屑、也不挂大标题 ——
+     * 那两处是页面的骨架，标签一多就把标题挤到下一行去了。
+     * 找不到那排标签（改版之类）才退回挂在书名后面。
+     */
     const badge = bookBadgeHTML(b);
-    document.querySelectorAll(FW.SEL.bookCrumb(Page.bid))
-      .forEach((el) => attachBadge(el, badge));
+    const crumbs = document.querySelectorAll(FW.SEL.bookCrumb(Page.bid));
+    const line = siteTagLine();
+    if (line) {
+      crumbs.forEach((el) => attachBadge(el, ''));      // 挂过的先撤掉
+      let box = line.parentElement.querySelector(':scope > [data-fw-meta]');
+      if (!box) {
+        box = document.createElement('div');
+        box.setAttribute('data-fw-meta', '1');
+        box.style.cssText = 'margin:4px 0 0;font-size:11px;line-height:1.9';
+        line.insertAdjacentElement('afterend', box);
+      }
+      if (box.innerHTML !== badge) box.innerHTML = badge;
+    } else {
+      crumbs.forEach((el) => attachBadge(el, badge));
+    }
 
     const panel = pageHost();
     if (!panel) return;
@@ -2841,46 +2877,40 @@
       const b = DB.book(m[1], false);
       if (!b || b.deleted) continue;
       done.add(m[1]);
-      if (!attachListRows(a, b)) attachBadge(a, bookBadgeHTML(b));   // 找不到条目就退回挂书名后
+      // 短角标（标签 / 标了几章 / 书签 / 📝）挂在书名后面；
+      // 进度另起一行靠右（attachListRows）。找不到 article 条目时进度也退回书名后
+      const inRow = attachListRows(a, b);
+      attachBadge(a, bookBadgeHTML(b, inRow));
     }
   }
 
   /*
-   * 列表页（收藏 / 文库 / 频道 / 索引）的角标**自己占两行**，不塞进书名那一行 ——
-   * 塞进去会把书名挤走、标题一长就折行，原来的排版全乱。
+   * 列表页（收藏 / 文库 / 频道 / 索引）：**进度**单独占一行、**靠右**。
+   * 标签那些短东西还是挂在书名后面（见 bookBadgeHTML），只有进度不行 ——
+   * 它带着章节名，长短不定，挤在书名或简介旁边会把人家的排版顶歪。
    *
-   * 每种列表页的 class 名都不一样，但骨架是一致的：
-   *   article > div.row > div.col-xs-*  （最后那个 col 是站点的「《最新章节》时间 + 标签」）
-   * 所以插在**最后那一列之前**：我们的标签行成了倒数第三行、进度行倒数第二行，
-   * 站点自己那行还留在最后。只有一列的页面（比如主题索引）没地方插，就追加到末尾。
+   * 每种列表页的 class 名都不一样，但骨架一致：
+   *   article > div.row > div.col-xs-*（最后那列是站点的「《最新章节》时间 + 标签」）
+   * 插在**最后那一列之前**，于是进度成了倒数第二行。
+   * 只有一列的页面（比如主题索引）没地方插，就追加到末尾。
    */
   function attachListRows(a, b) {
     const item = a.closest('article');
     if (!item) return false;
     const row = item.querySelector(':scope > .row') || item;
 
+    const bp = DB.prog(b.id);
     let box = row.querySelector(':scope > [data-fw-rows]');
+    if (!bp) { if (box) box.remove(); return false; }   // 没进度就不占这一行
     if (!box) {
       box = document.createElement('div');
       box.setAttribute('data-fw-rows', '1');
-      box.style.cssText = 'width:100%;font-size:11px;line-height:1.9';
+      box.style.cssText = 'width:100%;font-size:11px;line-height:1.9;text-align:right';
       const kids = [...row.children].filter((x) => !x.dataset.fwRows);
       if (kids.length >= 2) row.insertBefore(box, kids[kids.length - 1]);
       else row.appendChild(box);
     }
-
-    const bp = DB.prog(b.id);
-    const tags = (b.tags || []).map((t) => pill('#5a6b8c', esc(t))).join('');
-    const n = idx().markedCount(b.id);
-    const nb = idx().bmksOfBook(b.id).length;
-    const extra =
-      (n ? `<span style="color:#999;margin-left:4px">${n}章</span>` : '') +
-      (nb ? `<span style="color:#d98b00;margin-left:4px" title="${nb} 个书签">🔖${nb}</span>` : '') +
-      (b.review ? '<span style="margin-left:3px" title="有书评">📝</span>' : '');
-    const line = (inner) => (inner ? `<div>${inner}</div>` : '');
-    const html = line(tags + extra) +
-      line(bp ? progPill(b.id, '▶ ' + (bp.title || '读过')) +
-        (DB.isFinished(b.id) ? pill('#34a853', '✓ 读完') : '') : '');
+    const html = progPill(b.id, '▶ ' + (bp.title || '读过'));
     if (box.innerHTML !== html) box.innerHTML = html;
     return true;
   }
@@ -2929,6 +2959,23 @@
         (note ? `<span title="${esc(note)}" style="margin-left:6px;color:#8e8e93">📝 ${esc(note.slice(0, 16))}</span>` : '') +
         lastBtnHTML(ch);
       if (bar.innerHTML !== html) bar.innerHTML = html;
+
+      /*
+       * 最后一章**正文末尾**再放一个。读完那一刻人就在这儿，
+       * 让人再滚回章首去按顶上那个不合理 —— 顶上那个也留着，两处都能按。
+       */
+      const endHTML = lastBtnHTML(ch);
+      let end = ch.el.querySelector(':scope [data-fw-end="' + ch.pid + '"]');
+      if (!endHTML) { if (end) end.remove(); continue; }
+      if (!end) {
+        end = document.createElement('div');
+        end.setAttribute('data-fw-end', ch.pid);
+        end.style.cssText =
+          'margin:14px 0 6px;text-align:center;font-size:13px;line-height:2;' +
+          '-webkit-user-select:none;user-select:none';
+        (ch.body || ch.el).insertAdjacentElement('afterend', end);
+      }
+      if (end.innerHTML !== endHTML) end.innerHTML = endHTML;
     }
   }
 
