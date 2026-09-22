@@ -297,19 +297,28 @@ CHECK_JS = r"""
         var e = document.querySelector('a[href$="/threads/__TID__/profile"] [data-fw-badge]');
         return e ? e.textContent.trim() : '';
       })(),
-      // 标记条上那个能点的进度小条，整页只该有一条
-      barProgPills: n('[data-fw-bar] [data-fw-jump]'),
+      // 标记条上那条进度，整页只该有一条；它不跳转，点了是清掉进度
+      barProgPills: n('[data-fw-bar] [data-fw-progdel]'),
+      barProgJumps: n('[data-fw-bar] [data-fw-jump]'),
       // 最后一章正文末尾那个「我读完了」
       endBtns: n('[data-fw-end]'),
       endText: txt('[data-fw-end]').slice(0, 120),
       // 列表页：进度单独占一行、靠右；标签这些短的还是挂书名后
       listRows: n('[data-fw-rows]'),
       listRowsText: txt('[data-fw-rows]').slice(0, 400),
-      listRowsAlign: (function () {
+      listRowsFloat: (function () {
         var e = document.querySelector('[data-fw-rows]');
-        return e ? getComputedStyle(e).textAlign : '';
+        return e ? getComputedStyle(e).cssFloat : '';
+      })(),
+      // 状态小条必须和一句话简介同一行（不自己另占一行把条目撑高）
+      listRowsWithBrief: (function () {
+        var e = document.querySelector('[data-fw-rows]');
+        return !!(e && e.parentElement &&
+          e.parentElement.querySelector('span.smaller-5'));
       })(),
       titleBadges: n('a[href*="/threads/"] > [data-fw-badge]'),
+      // 书名（面包屑 / 大标题）后面那份角标的文字
+      crumbBadgeText: txt('a[href$="/threads/__TID__/profile"] [data-fw-badge]').slice(0, 200),
       // 详情页：角标挂在站点那排标签的下一行
       metaBox: n('[data-fw-meta]'),
       metaText: txt('[data-fw-meta]').slice(0, 300),
@@ -955,6 +964,10 @@ def main():
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}/chapter_index', '纯目录列表页', [
+            # 这一页没有站点标签行，也不该把进度写到标题上 ——
+            # 底下那条「上次读到…点这里继续」已经说清楚了
+            ('标题上不写进度',         lambda r: '▶' not in r['crumbBadgeText']),
+            ('但标签照旧挂着',         lambda r: '追更中' in r['crumbBadgeText']),
             # 还没从详情页学过时，这一页兜底，学到的就是它自己去重后的章节数
             ('没学过时目录列表页兜底',
              lambda r: r.get('learnedTotal') == CHAP_TOTAL),
@@ -974,7 +987,9 @@ def main():
             ('标记条上没有「读到这里」红字', lambda r: '读到这里' not in r['barsText']),
             # 进度小条挪到标记条上、书签钮后面了（面包屑是网站自己的东西，不去挤）
             ('面包屑上不挂进度了',     lambda r: r['crumbProg'] == ''),
-            ('标记条上只挂一条进度小条', lambda r: r['barProgPills'] == 1),
+            ('标记条上只挂一条进度',   lambda r: r['barProgPills'] == 1),
+            # 人就在书里读着，跳回「读到的位置」等于原地打转 —— 所以这条不跳转
+            ('那条进度不是跳转链',     lambda r: r['barProgJumps'] == 0),
             # 书签钮只留图标，不写字（标了是亮的、没标是灰的）
             ('书签钮只有图标、没有文字', lambda r: '🔖' in r['barsText']
              and '书签' not in r['barsText']),
@@ -1060,8 +1075,12 @@ def main():
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         ('/books?fwtest=legacy', '文库页 + v1.0 假数据迁移', [
-            ('进度单独占一行、靠右',   lambda r: r['listRows'] >= 1
-             and '▶' in r['listRowsText'] and r['listRowsAlign'] == 'right'),
+            ('状态小条靠右浮动、和简介同一行',
+             lambda r: r['listRows'] >= 1 and '▶' in r['listRowsText']
+             and r['listRowsFloat'] == 'right' and r['listRowsWithBrief'] is True),
+            # 列表页用短文案（第几章/共几章），不放章节名 —— 名字一长就顶歪简介
+            ('列表页用的是短文案',     lambda r: re.search(r'▶\s*\d+/\d+',
+                                                      r['listRowsText']) is not None),
             ('标签还是挂在书名后',     lambda r: r['titleBadges'] >= 1
              and '追更中' in r['badgeText']),
             ('那一行里不重复挂进度',   lambda r: '▶' not in r['badgeText']),

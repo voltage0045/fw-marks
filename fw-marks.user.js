@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.13.0
+// @version      1.14.0
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -905,6 +905,9 @@
       // 「有更新」不看站点自己那个 newchapter-badge —— 实际用起来经常不准。
       // 章节数由脚本自己数目录得出（点「查新章」时会抓一次目录页，见 checkUpdates）
       bookCrumb:   (tid) => 'a[href$="/threads/' + tid + '/profile"]', // 面包屑里的书名
+      // 章节自带的「上一章 / 目录 / 下一章」那排。点评、回帖没有这排 ——
+      // /posts/{id} 既可能是一章，也可能是一条点评，靠它区分
+      chapNav:     'a[href*="/chapter_index"]',
     },
     bodyOf: (pid) => '#full' + pid,
 
@@ -945,7 +948,14 @@
           // 排版 A 的标题区只有章节号（比如「2」），章节名不在这里
           title = (titleEl.textContent || '').replace(/\s+/g, ' ').trim();
         } else if (only) {
-          // 排版 B：h3 是章节号、h5 是章节名 —— 两个都要，拼起来才认得出是哪章
+          /*
+           * 排版 B 的坑：/posts/{id} 不一定是章节，也可能是一条**点评**
+           * （标题区长得很像，也有 .text-center strong）。点评没有
+           * 「上一章 / 目录 / 下一章」那排导航，据此剔掉 ——
+           * 不剔的话会把点评当成一章记进度。
+           */
+          if (!el.querySelector(this.SEL.chapNav)) continue;
+          // h3 是章节号、h5 是章节名 —— 两个都要，拼起来才认得出是哪章
           const hs = [...el.querySelectorAll('.text-center strong')]
             .map((x) => (x.textContent || '').replace(/\s+/g, ' ').trim())
             .filter((x) => x && x !== '.');
@@ -1799,14 +1809,18 @@
   const tagPills = (b) => (b.tags || [])
     .map((t) => `<span class="pill" style="background:#5a6b8c">${esc(t)}</span>`).join('');
 
-  // 书名后那个进度小标：收尾了就一个词，在读的给「第几章/共几章」
+  /*
+   * 书名后那个状态小标（面板里用，不跳转）。
+   * 和网页上那个状态小条是同一套语义、同一个位置，所以带上 ✕ / ✓ 的前缀 ——
+   * 不然「弃坑」状态和「弃坑」这个自定义标签并排挂着，看起来像重复了一次。
+   */
   function progTagHTML(b) {
-    if (!DB.prog(b.id)) return '';
     const p = DB.prog(b.id);
-    if (DB.isDropped(b.id)) return `<span class="pill" style="background:#9aa0a6">${DROP_TAG}</span>`;
-    if (DB.isFinished(b.id)) return '<span class="pill" style="background:#34a853">读完</span>';
+    if (!p) return '';
+    if (DB.isDropped(b.id)) return `<span class="pill" style="background:#9aa0a6">✕ ${DROP_TAG}</span>`;
+    if (DB.isFinished(b.id)) return '<span class="pill" style="background:#34a853">✓ 已读完</span>';
     const txt = p.no && b.chapTotal ? `${p.no}/${b.chapTotal}` : '在读';
-    return `<span class="pill" style="background:#5a6b8c">${txt}</span>`;
+    return `<span class="pill" style="background:#5a6b8c">▶ ${txt}</span>`;
   }
 
   // ---- tab 1：书签 ----
@@ -2520,13 +2534,33 @@
       (nb ? `<span style="margin-left:3px;color:#d98b00" title="${nb} 个书签">🔖${nb > 1 ? nb : ''}</span>` : '');
   }
 
-  // 能点的进度小条。章节名可能很长，所以限宽 + 省略号 + 明确不换行
-  const progPill = (bid, txt) =>
+  // 能点的小条（点了跳回读到的位置）。章节名可能很长，所以限宽 + 省略号 + 不换行
+  const progPill = (bid, txt, bg) =>
     `<span data-fw-jump="${esc(bid)}" title="点一下跳回读到的位置"` +
-    ` style="background:#e8554e;color:#fff;padding:1px 6px;border-radius:8px;` +
+    ` style="background:${bg || '#e8554e'};color:#fff;padding:1px 6px;border-radius:8px;` +
     `margin-left:3px;display:inline-block;max-width:11em;overflow:hidden;` +
     `text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom;cursor:pointer">` +
     `${esc(txt)}</span>`;
+
+  /*
+   * 这本书的「状态小条」—— 三种状态共用同一个位置，所以一眼就知道该看哪儿：
+   *   ✕ 弃坑   > ✓ 已读完 > ▶ 进度
+   * 弃坑优先于读完（坑都弃了，读到第几章无所谓了）；三者都能点，跳回读到的位置。
+   * 「弃坑」这个状态只在**有进度**时才显示 —— 没读过的书标了弃坑，
+   * 那就只是个普通标签，不该占状态位。
+   *
+   * short=true 给地方窄的场合（列表页）：用「第几章/共几章」而不是章节名，
+   * 章节名一长就把人家的一句话简介顶歪了。
+   */
+  function statusPill(b, short) {
+    const p = DB.prog(b.id);
+    if (!p) return '';
+    if (DB.isDropped(b.id)) return progPill(b.id, '✕ ' + DROP_TAG, '#9aa0a6');
+    if (DB.isFinished(b.id)) return progPill(b.id, '✓ 已读完', '#34a853');
+    const n = p.no, total = b.chapTotal;
+    if (short) return progPill(b.id, '▶ ' + (n && total ? `${n}/${total}` : (n || '读过')));
+    return progPill(b.id, '▶ ' + (p.title || '读过'));
+  }
 
   /*
    * 正文页的进度小条：只有「第几章/共几章」，挂在标记条上书签钮后面。
@@ -2539,17 +2573,24 @@
     const bp = b && !b.deleted ? DB.prog(b.id) : null;
     if (!bp) return '';
     const no = bp.no, total = b.chapTotal;
-    return ' ' + progPill(b.id, no && total ? `${no}/${total}`
-      : (no ? '第 ' + no + ' 章' : '已记下'));
+    const txt = no && total ? `${no}/${total}` : (no ? '第 ' + no + ' 章' : '已记下');
+    /*
+     * 这一条**不跳转** —— 人就在这本书里读着，跳回「读到的位置」等于原地打转。
+     * 它的点击留给「清掉这本书的进度」：想放弃这次记录时就在手边，
+     * 而且要过一道确认，免得读着读着误触就把进度清了。
+     */
+    return ` <span data-fw-progdel="${esc(b.id)}" title="点一下可以清掉这次进度记录"` +
+      ` style="background:#e8554e;color:#fff;padding:1px 6px;border-radius:8px;` +
+      `margin-left:3px;display:inline-block;white-space:nowrap;` +
+      `vertical-align:bottom;cursor:pointer">${esc(txt)}</span>`;
   }
 
   // 书籍角标：自定义标签 + 读到哪 + 标了几章 + 有书评。
   // noProg：进度已经在别处单独占一行了（列表页），这儿就别再挂一份
   function bookBadgeHTML(b, noProg) {
     if (!b || b.deleted) return '';
-    const bp = noProg ? null : DB.prog(b.id);
     const tags = (b.tags || []).map((t) => pill('#5a6b8c', esc(t))).join('');
-    const prog = bp ? progPill(b.id, '▶ ' + (bp.title || '读过')) : '';
+    const prog = noProg ? '' : statusPill(b, false);
     const n = idx().markedCount(b.id);
     const cnt = n ? `<span style="color:#999;margin-left:4px">${n}章</span>` : '';
     const nb = idx().bmksOfBook(b.id).length;
@@ -2832,7 +2873,13 @@
       }
       if (box.innerHTML !== badge) box.innerHTML = badge;
     } else {
-      crumbs.forEach((el) => attachBadge(el, badge));
+      /*
+       * 没有站点标签行（纯目录列表页就没有）。这时候标题上**不写进度** ——
+       * 底下那条「上次读到…点这里继续」已经把进度说得很清楚了，
+       * 标题上再挂一遍纯属重复，还会把面包屑挤到第二行。标签之类照旧挂。
+       */
+      const lite = bookBadgeHTML(b, true);
+      crumbs.forEach((el) => attachBadge(el, lite));
     }
 
     const panel = pageHost();
@@ -2885,32 +2932,29 @@
   }
 
   /*
-   * 列表页（收藏 / 文库 / 频道 / 索引）：**进度**单独占一行、**靠右**。
-   * 标签那些短东西还是挂在书名后面（见 bookBadgeHTML），只有进度不行 ——
-   * 它带着章节名，长短不定，挤在书名或简介旁边会把人家的排版顶歪。
+   * 列表页（收藏 / 文库 / 频道 / 索引）的状态小条：**贴着一句话简介那一行、靠右浮动**。
+   * 不自己另占一行 —— 那样条目会被撑高一截；也不挂书名后面 —— 会把书名挤走。
+   * 浮动 + 短文案（第几章/共几章）两条一起做，简介才不会被顶到下一行去。
    *
-   * 每种列表页的 class 名都不一样，但骨架一致：
-   *   article > div.row > div.col-xs-*（最后那列是站点的「《最新章节》时间 + 标签」）
-   * 插在**最后那一列之前**，于是进度成了倒数第二行。
-   * 只有一列的页面（比如主题索引）没地方插，就追加到末尾。
+   * 一句话简介在哪：每种列表页 class 名都不一样，但都是
+   * `article ... span.smaller-5`（里面裹着简介链接）。找不到就退回条目末尾。
    */
   function attachListRows(a, b) {
     const item = a.closest('article');
     if (!item) return false;
-    const row = item.querySelector(':scope > .row') || item;
 
-    const bp = DB.prog(b.id);
-    let box = row.querySelector(':scope > [data-fw-rows]');
-    if (!bp) { if (box) box.remove(); return false; }   // 没进度就不占这一行
+    const host = item.querySelector('span.smaller-5') || null;
+    const line = host ? (host.parentElement || host) : item;
+
+    const html = statusPill(b, true);
+    let box = line.querySelector(':scope > [data-fw-rows]');
+    if (!html) { if (box) box.remove(); return !!DB.prog(b.id); }
     if (!box) {
       box = document.createElement('div');
       box.setAttribute('data-fw-rows', '1');
-      box.style.cssText = 'width:100%;font-size:11px;line-height:1.9;text-align:right';
-      const kids = [...row.children].filter((x) => !x.dataset.fwRows);
-      if (kids.length >= 2) row.insertBefore(box, kids[kids.length - 1]);
-      else row.appendChild(box);
+      box.style.cssText = 'float:right;margin-left:6px;font-size:11px;line-height:1.9';
+      line.insertBefore(box, line.firstChild);   // 浮动元素要排在文字之前才环绕得对
     }
-    const html = progPill(b.id, '▶ ' + (bp.title || '读过'));
     if (box.innerHTML !== html) box.innerHTML = html;
     return true;
   }
@@ -3044,7 +3088,7 @@
   document.addEventListener('click', (e) => {
     const t = e.target instanceof Element
       ? e.target.closest('[data-fw-mark],[data-fw-bmk],[data-fw-open],[data-fw-jump],' +
-        '[data-fw-done]') : null;
+        '[data-fw-done],[data-fw-progdel]') : null;
     if (!t) return;
     e.preventDefault(); e.stopPropagation();
 
@@ -3066,6 +3110,19 @@
      * 最后一章末尾的「✓ 我读完了」：进度补成 100%、标上已读完，然后回书籍主页。
      * 补 100% 是故意的 —— 说读完了就别让进度还停在 93% 上刺眼。
      */
+    // 标记条上那条进度：点了清掉这本书的进度（要确认，免得误触）
+    if (t.hasAttribute('data-fw-progdel')) {
+      const bid = t.getAttribute('data-fw-progdel');
+      confirmBar('清掉这本书的阅读进度？书签和书评不动', () => {
+        const p = DB.prog(bid);
+        if (p) { p.deleted = true; DB.touch(p); }
+        toast('已清掉这本的进度');
+        paintAll();
+        if (sheet.classList.contains('on')) render();
+      });
+      return;
+    }
+
     if (t.hasAttribute('data-fw-done')) {
       const bid = t.getAttribute('data-fw-done');
       const p = DB.prog(bid);
