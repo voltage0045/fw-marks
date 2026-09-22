@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.14.0
+// @version      1.14.1
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1810,14 +1810,13 @@
     .map((t) => `<span class="pill" style="background:#5a6b8c">${esc(t)}</span>`).join('');
 
   /*
-   * 书名后那个状态小标（面板里用，不跳转）。
-   * 和网页上那个状态小条是同一套语义、同一个位置，所以带上 ✕ / ✓ 的前缀 ——
-   * 不然「弃坑」状态和「弃坑」这个自定义标签并排挂着，看起来像重复了一次。
+   * 书评 tab 里书名后那个状态小标（不跳转）。
+   * **弃坑不在这儿显示** —— 它是靠「弃坑」这个标签判出来的，而标签就并排挂在
+   * 旁边，再标一次就是同一件事说两遍。弃坑的归类留给进度 tab。
    */
   function progTagHTML(b) {
     const p = DB.prog(b.id);
-    if (!p) return '';
-    if (DB.isDropped(b.id)) return `<span class="pill" style="background:#9aa0a6">✕ ${DROP_TAG}</span>`;
+    if (!p || DB.isDropped(b.id)) return '';
     if (DB.isFinished(b.id)) return '<span class="pill" style="background:#34a853">✓ 已读完</span>';
     const txt = p.no && b.chapTotal ? `${p.no}/${b.chapTotal}` : '在读';
     return `<span class="pill" style="background:#5a6b8c">▶ ${txt}</span>`;

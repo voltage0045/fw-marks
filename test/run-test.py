@@ -483,6 +483,10 @@ CHECK_JS = r"""
         var rt = sr3 && sr3.querySelector('[data-tab="rate"]');
         if (rt) rt.click();
         r.tagRateListed = sr3 ? sr3.querySelectorAll('.book[data-bid="__TID__"]').length : 0;
+        // 打了弃坑之后，书评 tab 里只该有「弃坑」这一个标签 ——
+        // 不该再多一个 ✕ 弃坑 的状态标（同一件事说两遍）
+        r.tagRateTitle = sr3 ? ((sr3.querySelector('.book[data-bid="__TID__"] .bt')
+          || {}).textContent || '') : '';
         finish();
       }, 600);
       return;
@@ -1044,6 +1048,9 @@ def main():
             ('点完标签真写进存储了',  lambda r: r.get('tagInStore') is True),
             ('格子立刻变成选中态',    lambda r: r.get('tagChipOn') is True),
             ('书评 tab 立刻也列出来了', lambda r: r.get('tagRateListed') == 1),
+            ('书评 tab 里弃坑只出现一次',
+             lambda r: r.get('tagRateTitle', '').count('弃坑') == 1
+             and '✕' not in r.get('tagRateTitle', '')),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/collection/{UID}?fwtest=tagclick',
