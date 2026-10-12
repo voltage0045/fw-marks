@@ -321,6 +321,8 @@ CHECK_JS = r"""
       barProgJumps: n('[data-fw-bar] [data-fw-jump]'),
       // 最后一章正文末尾那个「我读完了」
       endText: txt('[data-fw-end]'),
+      endOpenBtns: n('[data-fw-end] [data-fw-open="all"]'),
+      endProg: n('[data-fw-end] [data-fw-progdel]'),
       // 列表页：进度单独占一行、靠右；标签这些短的还是挂书名后
       listRows: n('[data-fw-rows]'),
       listRowsText: txt('[data-fw-rows]').slice(0, 400),
@@ -398,13 +400,24 @@ CHECK_JS = r"""
       var sr = h && h.shadowRoot;
       var sh = sr ? sr.querySelector('.sheet') : null;
       r.navOpens = !!(sh && sh.classList.contains('on'));
-      // 书评并进进度之后，只剩「进度」「书签」两个 tab
-      r.tabCount = sr ? sr.querySelectorAll('.tabs [data-tab]').length : 0;
-      r.rateTabGone = sr ? !sr.querySelector('[data-tab="rate"]') : null;
+      // 只剩一张书单，tab 栏整个没了
+      r.tabCount = sr ? sr.querySelectorAll('.tabs, [data-tab]').length : -1;
+      // 浮层常态只占屏幕 2/3
+      r.sheetRatio = sr ? sr.querySelector('.sheet').getBoundingClientRect().height / innerHeight : 0;
       // 进度 tab：验「第几章/共几章」、有新章标记、以及读完的书被分出去
       var progTab = sr ? sr.querySelector('[data-tab="prog"]') : null;
       if (progTab) progTab.click();
       r.progText = sr ? ((sr.querySelector('[data-list]') || {}).textContent || '') : '';
+      // 每个分组标题最右边都有一个 🔄
+      r.grpCount = sr ? sr.querySelectorAll('[data-fold]').length : 0;
+      r.grpChkCount = sr ? sr.querySelectorAll('[data-fold] [data-chkgrp]').length : 0;
+      r.tidCardText = sr ? ((sr.querySelector('.book[data-bid="__TID__"] .bt') || {}).textContent || '') : '';
+      // 搜索框旁边的 🔖：只看有书签的书（种子里只有 TID 有书签）
+      var bo = sr ? sr.querySelector('[data-bmkonly]') : null;
+      if (bo) bo.click();
+      r.bmkOnlyOrder = sr ? [].map.call(sr.querySelectorAll('[data-list] .book'),
+        function (e) { return e.getAttribute('data-bid'); }) : [];
+      if (bo) bo.click();       // 关回去
       r.progSub = sr ? ((sr.querySelector('.sheet header .sub') || {}).textContent || '') : '';
       r.progOrder = sr ? [].map.call(sr.querySelectorAll('[data-list] .book'),
         function (e) { return e.getAttribute('data-bid'); }) : [];
@@ -469,9 +482,7 @@ CHECK_JS = r"""
       var sr2 = h2 && h2.shadowRoot;
       var nav2 = document.querySelector('[data-fw-nav] [data-fw-open]');
       if (nav2) nav2.click();
-      var pt = sr2 ? sr2.querySelector('[data-tab="prog"]') : null;
-      if (pt) pt.click();
-      var btn2 = sr2 ? sr2.querySelector('[data-act="chkupd"]') : null;
+      var btn2 = sr2 ? sr2.querySelector('[data-chkgrp="reading"]') : null;
       r.updBtn = !!btn2;
       if (btn2) btn2.click();
       setTimeout(function () {
@@ -480,7 +491,13 @@ CHECK_JS = r"""
         r.updTotal = bk.chapTotal || null;
         r.updCheckedAt = bk.chapCheckedAt || null;
         r.updCids = (bk.cids || []).length;
-        finish();
+        // 再点「接下来看」那组的 🔄：这回才查它
+        var b3 = sr2 ? sr2.querySelector('[data-chkgrp="next"]') : null;
+        if (b3) b3.click();
+        setTimeout(function () {
+          r.updQueuedAfter = ((db().books || {})['__QUEUE__'] || {}).chapTotal || null;
+          finish();
+        }, 4000);
       }, 5000);
       return;
     }
@@ -571,6 +588,52 @@ CHECK_JS = r"""
     if (location.search.indexOf('fwtest=dequeue') >= 0) {
       r.dequeued = !(((db().books || {})['__TID__'] || {}).queued);
       return finish();
+    }
+
+    // 书籍详情页点 🔖n：展开书签都在哪几章，按章节顺序
+    if (location.search.indexOf('fwtest=bmklist') >= 0) {
+      var bl = document.querySelector('[data-fw-bmklist="__TID__"]');
+      r.bmkBtn = !!bl;
+      r.bmkListBefore = document.querySelectorAll('[data-fw-bmks] [data-fw-bmkjump]').length;
+      if (bl) bl.click();
+      setTimeout(function () {
+        r.bmkListItems = [].map.call(document.querySelectorAll('[data-fw-bmks] [data-fw-bmkjump]'),
+          function (e) { return e.textContent.trim(); });
+        finish();
+      }, 400);
+      return;
+    }
+
+    // 按住标题栏上下拖：往上 → 全屏，往下 → 回常态
+    if (location.search.indexOf('fwtest=drag') >= 0) {
+      var h6 = document.getElementById('__fw_marks__');
+      var sr6 = h6 && h6.shadowRoot;
+      var nav6 = document.querySelector('[data-fw-nav] [data-fw-open]');
+      if (nav6) nav6.click();
+      var sh6 = sr6.querySelector('.sheet'), hd6 = sr6.querySelector('.sheet header');
+      var ev = function (type, target, y) {
+        target.dispatchEvent(new PointerEvent(type, { bubbles: true, composed: true,
+          clientX: 100, clientY: y, pointerId: 1, isPrimary: true }));
+      };
+      var top6 = hd6.getBoundingClientRect().top + 10;
+      ev('pointerdown', hd6, top6); ev('pointermove', window, 20); ev('pointerup', window, 20);
+      setTimeout(function () {
+        r.dragFull = sh6.classList.contains('full');
+        r.dragFullRatio = sh6.getBoundingClientRect().height / innerHeight;
+        var t2 = hd6.getBoundingClientRect().top + 10;
+        ev('pointerdown', hd6, t2); ev('pointermove', window, t2 + innerHeight * 0.3);
+        ev('pointerup', window, t2 + innerHeight * 0.3);
+        setTimeout(function () {
+          r.dragBackNormal = !sh6.classList.contains('full') && sh6.classList.contains('on');
+          r.dragNormalRatio = sh6.getBoundingClientRect().height / innerHeight;
+          // 标题栏里的按钮照常能点：点 ⚙️ 进设置，不会被当成拖
+          var g6 = sr6.querySelector('.gear');
+          if (g6) g6.click();
+          r.dragGearWorks = sr6.querySelector('.sheet header h3').textContent === '设置';
+          finish();
+        }, 400);
+      }, 400);
+      return;
     }
 
     /* 云端的进度只到「第几章」：章内位置只留本机。
@@ -1134,8 +1197,12 @@ def main():
             ('目录上方有 3 个操作按钮', lambda r: r['pageActions'] == 3),
             ('顶栏那一项写着「我的标记」', lambda r: '我的标记' in r['navText']),
             ('点顶栏入口能打开面板',   lambda r: r['navOpens'] is True),
-            ('只剩进度、书签两个 tab', lambda r: r.get('tabCount') == 2
-             and r.get('rateTabGone') is True),
+            ('tab 栏整个没了（只剩一张书单）', lambda r: r.get('tabCount') == 0),
+            ('浮层常态只占屏幕约 2/3', lambda r: 0.6 < (r.get('sheetRatio') or 0) < 0.72),
+            ('每个分组标题右边都有 🔄', lambda r: r.get('grpCount', 0) >= 3
+             and r.get('grpChkCount') == r.get('grpCount')),
+            ('有书签的书在卡片上标 🔖2', lambda r: '🔖2' in r.get('tidCardText', '')),
+            ('点 🔖 只看有书签的书',   lambda r: r.get('bmkOnlyOrder') == [TID]),
             ('进度显示「当前章/总章数」',
              lambda r: re.search(r'\d+/\d+', r.get('progText', '')) is not None),
             ('有新章会标出来',         lambda r: '有新章' in r.get('progText', '')),
@@ -1238,6 +1305,8 @@ def main():
             (f'{len(PIDS)} 章都挂上了标记条', lambda r: r['bars'] == len(PIDS)),
             ('标记条上有三个标签钮',   lambda r: r['markBtns'] == len(PIDS) * 3),
             (f'每章都有书签钮',        lambda r: r['bmkBtns'] == len(PIDS)),
+            ('章末有「我的标记」入口、不放进度', lambda r: r.get('endOpenBtns') == len(PIDS)
+             and r.get('endProg') == 0),
             # 章末也有一条一样的标记条，读完一章不用滚回章首
             ('每章末尾也有一条标记条', lambda r: r['endBars'] == len(PIDS)
              and r['endMarkBtns'] == len(PIDS) * 3 and r['endBmkBtns'] == len(PIDS)),
@@ -1295,14 +1364,15 @@ def main():
              lambda r: (r.get('savedAt') or 0) > 0),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
-        (f'/threads/{TID}?fwtest=upd', '手动查新章（不用点开每本书）', [
+        (f'/threads/{TID}?fwtest=upd', '按组查新章（点分组标题右边的 🔄）', [
             ('没点之前不后台偷查',   lambda r: r.get('updBefore') == 3),
-            ('进度 tab 里有「查新章」按钮', lambda r: r.get('updBtn') is True),
+            ('「在读」那组标题右边有 🔄', lambda r: r.get('updBtn') is True),
             ('点了之后章节数被更新成详情页那份',
              lambda r: r.get('updTotal') == CHAP_TOTAL_PROFILE
              and r.get('updCids') == CHAP_TOTAL_PROFILE),
             ('记下了这次查过的时间', lambda r: (r.get('updCheckedAt') or 0) > 1),
-            ('「接下来看」的书不查',   lambda r: r.get('updQueuedTotal') == 2),
+            ('点在读的 🔄 不查「接下来看」那组', lambda r: r.get('updQueuedTotal') == 2),
+            ('点「接下来看」的 🔄 才查它',   lambda r: r.get('updQueuedAfter') == CHAP_TOTAL_PROFILE),
             ('没有 JS 报错',        lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}?fwtest=tagclick', '进度 tab 里打弃坑 → 写好了才挪组', [
@@ -1381,6 +1451,22 @@ def main():
         ]),
         (f'/posts/{PID_PROGRESS}?fwtest=dequeue', '排队的书一开读就出队', [
             ('开始读了，移出「接下来看」', lambda r: r.get('dequeued') is True),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=bmklist', '详情页点 🔖 看书签在哪几章', [
+            ('站点标签下那行有 🔖 按钮', lambda r: r.get('bmkBtn') is True),
+            ('没点之前不展开',         lambda r: r.get('bmkListBefore') == 0),
+            # 章节名会被目录里学到的全名替换掉，所以只看「第 2 章在第 4 章前面」
+            ('点开按章节顺序列出来',
+             lambda r: [x.split()[1] for x in (r.get('bmkListItems') or [])] == ['2', '4']),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=drag', '按住标题栏上下拖', [
+            ('往上拖 → 全屏',         lambda r: r.get('dragFull') is True
+             and (r.get('dragFullRatio') or 0) > 0.95),
+            ('往下拖 → 回常态',       lambda r: r.get('dragBackNormal') is True
+             and 0.6 < (r.get('dragNormalRatio') or 0) < 0.72),
+            ('标题栏里的 ⚙️ 照常能点', lambda r: r.get('dragGearWorks') is True),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}?fwtest=crosstab', '两个标签页同时写 → 不许互相冲掉', [
@@ -1497,7 +1583,7 @@ def main():
             if not ok:
                 failed_cases.append(f'{label} / {name}')
                 if os.environ.get('FW_DEBUG'):
-                    print('     debug:', json.dumps({k:r.get(k) for k in ('crumbProg','listRows','listRowsText','titleBadges','badgeText')}, ensure_ascii=False)[:500])
+                    print('     debug:', json.dumps({k:r.get(k) for k in ('bmkBtn','bmkListBefore','bmkListItems')}, ensure_ascii=False)[:500])
             print(f'  {"✅" if ok else "❌"} {name}')
         if r['jsErrors']:
             print('   JS 报错：', r['jsErrors'])

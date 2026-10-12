@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.16.0
+// @version      1.17.0
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1585,15 +1585,29 @@
   }
   .mask.on { display: block; }
 
+  /*
+   * 常态只占屏幕 2/3：上面露出一大截背景，点它就能关。
+   * 按住标题栏往上拖 → 全屏，往下拖 → 回常态（从常态再往下拖一大截 = 关掉）。
+   * dvh 是给 iOS 的：地址栏伸缩时 vh 不准，不认 dvh 的老版本退回 vh。
+   */
   .sheet {
-    position: fixed; left: 0; right: 0; bottom: 0; max-height: 86vh;
+    position: fixed; left: 0; right: 0; bottom: 0;
+    height: 66vh; height: 66dvh;
     background: #fff; color: #1c1c1e; z-index: 2147483200;
     border-radius: 16px 16px 0 0; box-shadow: 0 -4px 24px rgba(0,0,0,.25);
-    transform: translateY(100%); transition: transform .24s ease;
+    transform: translateY(100%); transition: transform .24s ease, height .2s ease;
     display: flex; flex-direction: column;
     padding-bottom: env(safe-area-inset-bottom, 0);
   }
   .sheet.on { transform: translateY(0); }
+  .sheet.full { height: 100vh; height: 100dvh; border-radius: 0; }
+  .sheet.drag { transition: none; }
+  /* 拖动把手 + 标题栏都能拖；不让浏览器拿这一下去滚页面 */
+  .sheet .grab { flex: none; width: 38px; height: 5px; border-radius: 3px;
+    background: #d1d1d6; margin: 7px auto 0; }
+  .sheet .grab, .sheet header { touch-action: none; cursor: ns-resize; }
+  .sheet header button, .sheet header .gear { cursor: pointer; }
+  :host(.dark) .sheet .grab { background: #48484f; }
   .sheet header {
     display: flex; align-items: center; gap: 8px;
     padding: 13px 14px; border-bottom: 1px solid #ececec; flex: none;
@@ -1653,6 +1667,8 @@
   .grp { margin: 16px 0 6px; font-size: 12px; color: #8e8e93; cursor: pointer;
     -webkit-user-select: none; user-select: none; }
   .grp .n { margin-left: 4px; color: #aeaeb2; }
+  .grp { display: flex; align-items: center; }
+  .grp .chk { margin-left: auto; padding: 2px 6px; font-size: 13px; opacity: .85; }
   .rvbox { margin-top: 8px; border-top: 1px dashed #e5e5e7; padding-top: 8px; }
   .rvbox .tags { margin-bottom: 2px; }
   .rvbox .t { font-size: 12px; padding: 4px 9px; }
@@ -1679,6 +1695,13 @@
   .sw.on { background: #34a853; }
   .sw.on::after { transform: translateX(18px); }
 
+  .srch { display: flex; gap: 8px; align-items: center; }
+  .srch input { flex: 1; }
+  .srch .t { flex: none; cursor: pointer; padding: 7px 10px; border-radius: 10px;
+    background: #f0f0f2; border: 1.5px solid transparent; font-size: 14px; }
+  .srch .t.on { background: #fff4dc; border-color: #d98b00; }
+  :host(.dark) .srch .t { background: #2c2c31; }
+  :host(.dark) .srch .t.on { background: #3a2f17; border-color: #d98b00; }
   .tabs { display: flex; gap: 6px; margin-bottom: 13px; }
   .tabs button {
     flex: 1; padding: 8px 0; border: none; border-radius: 9px;
@@ -1757,6 +1780,7 @@
 
 <div class="mask"></div>
 <div class="sheet">
+  <div class="grab"></div>
   <header><h3></h3><span class="gear" title="设置">⚙️</span><span class="sub"></span>
     <button class="btn g sm moon" title="黑夜模式">🌙</button>
     <button class="btn g sm cls">关闭</button></header>
@@ -1791,7 +1815,11 @@
 
   // 'ctx' = 当前这本书 | 'all' = 我的标记 | 'cfg' = 设置
   let view = 'ctx';
-  function openSheet(v) { view = v || 'ctx'; render(); mask.classList.add('on'); sheet.classList.add('on'); }
+  function openSheet(v) {
+    view = v || 'ctx';
+    sheet.classList.remove('full');      // 每次打开都从常态（2/3 高）开始
+    render(); mask.classList.add('on'); sheet.classList.add('on');
+  }
   function closeSheet() {
     mask.classList.remove('on'); sheet.classList.remove('on');
     closeEditor();    // 下次打开不要还挂着上次那个展开的编辑框
@@ -1799,6 +1827,42 @@
   // 页面上各处入口统一走这里
   function openView(v) { openSheet(v === 'book' ? 'ctx' : v); }
   mask.onclick = closeSheet;
+
+  /*
+   * 按住标题栏上下拖。松手时按高度落到三档之一：
+   *   高过 83% → 全屏；矮过 40% → 关掉；其余 → 常态（2/3）。
+   * 只点一下不拖，高度不变，落回原来那一档。标题栏里的按钮照常点。
+   */
+  {
+    let y0 = 0, h0 = 0, dragging = false;
+    const inGrab = (el) => el.closest && el.closest('.grab, header') &&
+      !el.closest('button, .gear');
+    sheet.addEventListener('pointerdown', (e) => {
+      if (!inGrab(e.target)) return;
+      dragging = true;
+      y0 = e.clientY;
+      h0 = sheet.getBoundingClientRect().height;
+      sheet.classList.add('drag');
+      e.preventDefault();
+    });
+    addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const h = Math.max(innerHeight * 0.25, Math.min(innerHeight, h0 + (y0 - e.clientY)));
+      sheet.style.height = h + 'px';
+    });
+    const drop = () => {
+      if (!dragging) return;
+      dragging = false;
+      const h = sheet.getBoundingClientRect().height;
+      sheet.classList.remove('drag');
+      sheet.style.height = '';
+      if (h > innerHeight * 0.83) sheet.classList.add('full');
+      else if (h < innerHeight * 0.4) closeSheet();
+      else sheet.classList.remove('full');
+    };
+    addEventListener('pointerup', drop);
+    addEventListener('pointercancel', drop);
+  }
   $('.cls').onclick = closeSheet;
   // 标题「我的标记」后面那个 ⚙️：直接进设置
   $('.gear').onclick = () => {
@@ -1951,14 +2015,12 @@
   // ---- 管理面板：所有书 + 搜索 ----
   // 搜索时只重绘列表、不动输入框 —— 否则 iOS 上每输一个字键盘都会闪一下
   let searchKw = '';
-  // 三件事用法完全不同：书签是「回到某处」，进度是「接着读」，书评是「这书怎么样」。
-  // 所以拆成三个 subtab，搜索框在当前 tab 内生效
   /*
-   * 书评原来单独一个 tab，现在并进「进度」：一本书读到哪、读完没、怎么评的，
-   * 本来就是同一张卡片上的事，分两处看反而要来回切。
+   * 原来分「进度 / 书签 / 书评」三个 tab，现在只剩一张书单：一本书读到哪、
+   * 读完没、怎么评的、有没有书签，本来就是同一张卡片上的事。
+   * 书签具体在哪几章，去书籍详情页点 🔖 看（那儿才是要跳过去的地方）。
    */
-  const ALL_TABS = [['prog', '▶ 进度'], ['bmk', '🔖 书签']];
-  let allTab = 'prog';   // 默认看进度：进来最常想知道的是「上次读到哪」
+  let bmkOnly = false;   // 只看有书签的书
   // 哪本书的「✏️ 写书评 / 打标签」编辑框是展开的（一次只开一个）。
   // 存成状态而不是直接 toggle class：点标签会重绘列表，重绘完得还开着
   let editing = null;
@@ -1972,12 +2034,9 @@
     if (kw !== undefined) searchKw = kw;
     sTitle.textContent = '我的标记';
     sBody.innerHTML = `
-      <div class="tabs">
-        ${ALL_TABS.map(([k, label]) =>
-          `<button data-tab="${k}" class="${allTab === k ? 'on' : ''}">${label}</button>`).join('')}
-      </div>
-      <div class="row"><input type="text" data-search placeholder="搜书名 / 章节 / 书评 / 标签…"
-        value="${esc(searchKw)}" autocapitalize="off" autocorrect="off"></div>
+      <div class="row srch"><input type="text" data-search placeholder="搜书名 / 章节 / 书评 / 标签…"
+        value="${esc(searchKw)}" autocapitalize="off" autocorrect="off">
+        <span class="t ${bmkOnly ? 'on' : ''}" data-bmkonly title="只看有书签的书">🔖</span></div>
       <div data-list></div>
       ${navBtns(bookBtn())}
     `;
@@ -1988,18 +2047,13 @@
   // 「上次数章节的时间」这种辅助信息：只要 月/日 时:分，靠右挂在书名那行
   const when = (ts) => new Date(ts).toLocaleString('zh-CN',
     { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  // 最近有动静的排最前，三个 tab 一致
-  const booksByRecent = () =>
-    DB.liveBooks().sort((a, b) => DB.lastActive(b.id) - DB.lastActive(a.id));
   const emptyBox = (kw, hint) =>
     `<div class="empty">${kw ? '没搜到喵' : hint}</div>`;
 
   function paintList() {
     const box = sBody.querySelector('[data-list]');
     if (!box) return;
-    const kw = (searchKw || '').toLowerCase();
-    if (allTab === 'bmk') return paintBmkTab(box, kw);
-    return paintProgTab(box, kw);
+    return paintProgTab(box, (searchKw || '').toLowerCase());
   }
 
   // ---- 书名后面那支铅笔，和它展开的编辑块 ----
@@ -2034,28 +2088,6 @@
   const tagPills = (b) => (b.tags || [])
     .map((t) => `<span class="pill" style="background:#5a6b8c">${esc(t)}</span>`).join('');
 
-  // ---- tab 1：书签 ----
-  function paintBmkTab(box, kw) {
-    const rows = [];
-    let total = 0;
-    for (const b of booksByRecent()) {
-      const bs = DB.bmksOf(b.id);
-      total += bs.length;
-      if (!bs.length) continue;
-      const nameHit = (b.title || '').toLowerCase().includes(kw);
-      const list = !kw || nameHit ? bs : bs.filter((m) =>
-        ((m.title || '') + (m.anchor || '')).toLowerCase().includes(kw));
-      if (!list.length) continue;
-      rows.push(`<div class="book" data-bid="${esc(b.id)}">
-        <div class="bt">${bookName(b)} <span class="n">🔖 ${list.length}</span></div>
-        ${bmkListHTML(list)}
-      </div>`);
-    }
-    sSub.textContent = total ? `共 ${total} 个书签` : '';
-    box.innerHTML = rows.length ? rows.join('')
-      : emptyBox(kw, '还没有书签喵～<br>读正文时点章节下面那个 🔖');
-  }
-
   // ---- tab：进度（连同书评、标签、章节标记）----
   /*
    * 从 prog 表出发而不是从书出发 —— 书记录可能还没建或被软删过，
@@ -2078,7 +2110,11 @@
     return p ? 'reading' : null;                // 没进度、也没排队的不列
   }
 
-  function paintProgTab(box, kw) {
+  /*
+   * 书单上的每一本书和它所在的组。画列表、按组查新章都用这一份 ——
+   * 两边分组规则必须一模一样，不然「点在读的 🔄」查的就不是你看到的那几本。
+   */
+  function shelf() {
     const seen = new Set();
     const items = [];
     const add = (b, p) => {
@@ -2086,14 +2122,9 @@
       seen.add(b.id);
       const group = groupOf(b, p);
       if (!group) return;
-      const cs = DB.chapsOf(b.id).filter((c) => c.mark || c.note);
-      const hit = !kw || [b.title, p && p.title, b.review, ...(b.tags || []),
-        ...cs.map((c) => (c.title || '') + (c.note || ''))]
-        .some((x) => (x || '').toLowerCase().includes(kw));
-      if (!hit) return;
       const key = group === 'next' ? -(b.queuedAt || 0)
         : p ? (p.updatedAt || 0) : (b.updatedAt || 0);
-      items.push({ b, p, cs, group, key });
+      items.push({ b, p, group, key });
     };
     for (const p of Object.values(DB.d.prog)) {
       if (!p || p.deleted || !p.bid) continue;
@@ -2102,7 +2133,20 @@
     for (const b of DB.liveBooks()) {
       if (b.queued || b.doneRead || DB.isDropped(b.id)) add(b, null);
     }
-    items.sort((x, y) => y.key - x.key);
+    return items.sort((x, y) => y.key - x.key);
+  }
+
+  function paintProgTab(box, kw) {
+    const items = [];
+    for (const x of shelf()) {
+      const cs = DB.chapsOf(x.b.id).filter((c) => c.mark || c.note);
+      const bms = DB.bmksOf(x.b.id);
+      if (bmkOnly && !bms.length) continue;
+      const hit = !kw || [x.b.title, x.p && x.p.title, x.b.review, ...(x.b.tags || []),
+        ...cs.map((c) => (c.title || '') + (c.note || '')), ...bms.map((m) => m.title)]
+        .some((v) => (v || '').toLowerCase().includes(kw));
+      if (hit) items.push(Object.assign(x, { cs, nb: bms.length }));
+    }
 
     const fold = DB.d.cfg.fold || {};
     const count = (g) => items.filter((x) => x.group === g).length;
@@ -2111,26 +2155,18 @@
       .filter(Boolean).join(' · ');
 
     const parts = [];
-    if (count('reading')) {
-      parts.push(`<div class="btns" style="margin-bottom:6px">
-        <button class="btn g sm" data-act="chkupd">🔄 查一下有没有新章</button>
-      </div>
-      <div class="hint" style="margin:0 0 4px">
-        章节数是脚本<b>自己去数目录</b>得出的（站内那个「有更新」标记不太准）。<br>
-        只查<b>在读</b>的书 —— 接下来看的、读完的、弃坑的都不查。
-      </div>`);
-    }
     for (const [g, label] of GROUPS) {
       const list = items.filter((x) => x.group === g);
       if (!list.length) continue;
-      // 收起来的组只留一行标题，点一下再展开
+      // 组名点一下收起 / 展开；最右边的 🔄 只查这一组的新章
       parts.push(`<div class="grp" data-fold="${g}">${fold[g] ? '▸' : '▾'} ${esc(label)}
-        <span class="n">${list.length}</span></div>`);
+        <span class="n">${list.length}</span>
+        <span class="chk" data-chkgrp="${g}" title="查这一组有没有新章">🔄</span></div>`);
       if (fold[g]) continue;
       parts.push(...list.map((x) => progCardHTML(x)));
     }
     box.innerHTML = parts.length ? parts.join('')
-      : emptyBox(kw, '还没有阅读进度喵～<br>读几章就会自动记下来');
+      : emptyBox(kw || bmkOnly, bmkOnly ? '' : '还没有阅读进度喵～<br>读几章就会自动记下来');
   }
 
   /*
@@ -2138,7 +2174,7 @@
    * 「什么时候数过章节」靠右。下面是读到哪、书评原文（收起编辑框时）、编辑框、按钮。
    * 只有「在读」显示「第几章/共几章」和查章节时间 —— 收尾了的书还盯着 9/9 没意义。
    */
-  function progCardHTML({ b, p, cs, group }) {
+  function progCardHTML({ b, p, cs, nb, group }) {
     const live = group === 'reading';
     const no = p && p.no, total = b.chapTotal;
     const hasNew = live && no && total && no < total;
@@ -2154,6 +2190,7 @@
         ${tagPills(b)}
         ${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) =>
           `<span class="pill" style="background:${MARKS[k].color}">${MARKS[k].label} ${v}</span>`).join('')}
+        ${nb ? `<span class="pill" style="background:#d98b00" title="${nb} 个书签，具体哪几章去书籍详情页点 🔖 看">🔖${nb}</span>` : ''}
         ${penHTML(b.id)}
         ${at ? `<span class="when" title="上次数章节的时间">🕘 ${when(at)}</span>` : ''}
       </div>
@@ -2342,8 +2379,8 @@
         <div class="hint">
           站点自己那个「有更新」标记不太准，所以章节数是脚本<b>自己去数目录</b>得出的。<br>
           这件事<b>只在你点的时候才做</b>，不后台偷跑：
-          <b>📑 我的标记 → ▶ 进度 → 🔄 查一下有没有新章</b>。<br>
-          只查在读、且没标完结的书。
+          <b>📑 我的标记</b> 里每一组标题最右边的 <b>🔄</b>，只查那一组。<br>
+          站点标了完结的书不查。
         </div>
       </div>
       <div class="btns">
@@ -2380,7 +2417,7 @@
   // ==========================================================================
   sBody.addEventListener('click', async (e) => {
     const t = e.target.closest('[data-act],[data-go],[data-tag],[data-jump],[data-ratedel],' +
-      '[data-toggle],[data-bmkgo],[data-bmkdel],[data-bmktoggle],[data-tab],' +
+      '[data-toggle],[data-bmkgo],[data-bmkdel],[data-bmktoggle],[data-bmkonly],[data-chkgrp],' +
       '[data-progdel],[data-backon],[data-pen],[data-pendone],[data-btag],[data-newtag],' +
       '[data-doneread],[data-tagmgr],[data-tagren],[data-tagdel],[data-fold],[data-dark],' +
       '[data-queue]');
@@ -2403,12 +2440,20 @@
       return;
     }
 
-    // ---- 「我的标记」的三个 subtab ----
-    if (t.dataset.tab) {
-      closeEditor();
-      allTab = t.dataset.tab;
-      render();
-      sBody.scrollTop = 0;
+    // 搜索框旁边那个 🔖：只看有书签的书
+    if (t.hasAttribute('data-bmkonly')) {
+      syncDraft();
+      bmkOnly = !bmkOnly;
+      t.classList.toggle('on', bmkOnly);
+      paintList();
+      return;
+    }
+
+    // 分组标题右边那个 🔄：只查这一组的书
+    if (t.dataset.chkgrp) {
+      syncDraft();
+      await checkUpdates(t.dataset.chkgrp);
+      paintList();
       return;
     }
 
@@ -2624,10 +2669,6 @@
       }
       case 'syncNow': await Sync.run(false); break;
       case 'diag': await runDiag(); break;
-      case 'chkupd':
-        await checkUpdates();   // 提示语由它自己报（要显示 3/12 这种进度）
-        render();
-        break;
       case 'export': {
         const json = JSON.stringify(Sync.snapshot(), null, 1);
         try {
@@ -2826,14 +2867,19 @@
 
   // 书籍角标：自定义标签 + 读到哪 + 标了几章 + 有书评。
   // noProg：进度已经在别处单独占一行了（列表页），这儿就别再挂一份
-  function bookBadgeHTML(b, noProg) {
+  // bmkBtn：书籍详情页上，🔖n 做成按钮，点开下面列出书签在哪几章
+  function bookBadgeHTML(b, noProg, bmkBtn) {
     if (!b || b.deleted) return '';
     const tags = (b.tags || []).map((t) => pill('#5a6b8c', esc(t))).join('');
     const prog = noProg ? '' : statusPill(b, false);
     const n = idx().markedCount(b.id);
     const cnt = n ? `<span style="color:#999;margin-left:4px">${n}章</span>` : '';
     const nb = idx().bmksOfBook(b.id).length;
-    const bm = nb ? `<span style="color:#d98b00;margin-left:4px" title="${nb} 个书签">🔖${nb}</span>` : '';
+    const bm = !nb ? '' : bmkBtn
+      ? `<span data-fw-bmklist="${esc(b.id)}" title="看书签都在哪几章" style="margin-left:5px;` +
+        `padding:1px 7px;border-radius:9px;cursor:pointer;background:#d98b0022;color:#d98b00;` +
+        `font-weight:700">🔖${nb} ${bmkOpen ? '▴' : '▾'}</span>`
+      : `<span style="color:#d98b00;margin-left:4px" title="${nb} 个书签">🔖${nb}</span>`;
     const rev = b.review ? '<span style="margin-left:3px" title="有书评">📝</span>' : '';
     return tags + prog + cnt + bm + rev;
   }
@@ -3015,15 +3061,20 @@
     return hit;
   }
 
-  async function checkUpdates() {
+  /*
+   * 查某一组的新章（分组标题右边那个 🔄）。
+   * 查哪几本和列表上看到的那组一模一样（都用 shelf()）；
+   * 站点标了「完结」的跳过 —— 完结文不会再多章节，查了也白查。
+   */
+  async function checkUpdates(group) {
     if (!Page.native) { toast('这一页查不了喵，在站内页面再点'); return 0; }
 
-    const due = DB.liveBooks()
-      .filter((b) => DB.prog(b.id) && b.done !== true && !b.queued &&
-                     !DB.isFinished(b.id) && !DB.isDropped(b.id))
+    const due = shelf()
+      .filter((x) => x.group === group && x.b.done !== true)
+      .map((x) => DB.editBook(x.b.id))
       .sort((a, c) => (a.chapCheckedAt || 0) - (c.chapCheckedAt || 0));
     const list = due.slice(0, CHECK_MAX);
-    if (!list.length) { toast('没有在读的书要查喵'); return 0; }
+    if (!list.length) { toast('这一组没有要查的书喵（完结的不查）'); return 0; }
 
     let changed = 0, i = 0;
     for (const b of list) {
@@ -3045,6 +3096,7 @@
                   : `${list.length} 本都查过了，没发现新章${more}`);
     return changed;
   }
+
 
   // 站点把「完结 / 连载」做成了书籍标签链接，title 属性拿得最稳。
   // 这一页没写就返回 null —— 别把已经学到的值覆盖掉
@@ -3103,6 +3155,29 @@
     return document.querySelector('.panel-body') || null;
   }
 
+  /*
+   * 书籍详情页上点 🔖n 展开的书签清单：书签都在哪几章，按章节顺序排，点一条就跳过去。
+   * 书签原来有自己的 tab，现在「我的标记」里只标有没有、能筛；具体在哪章在这儿看 ——
+   * 要跳过去的话，人本来就在这本书的页面上。
+   */
+  let bmkOpen = false;
+  function paintBmkList(after) {
+    let list = after.parentElement.querySelector(':scope > [data-fw-bmks]');
+    const bms = DB.bmksOf(Page.bid);
+    if (!bmkOpen || !bms.length) { if (list) list.remove(); return; }
+    if (!list) {
+      list = document.createElement('div');
+      list.setAttribute('data-fw-bmks', '1');
+      list.style.cssText = 'margin:6px auto 0;max-width:30em;text-align:left;font-size:13px;line-height:1.9';
+      after.insertAdjacentElement('afterend', list);
+    }
+    const order = (m) => DB.chapNo(Page.bid, m.cid) || 1e9;
+    const html = bms.slice().sort((x, y) => order(x) - order(y) || (x.createdAt || 0) - (y.createdAt || 0))
+      .map((m) => `<div data-fw-bmkjump="${esc(m.key)}" style="cursor:pointer;padding:2px 8px;` +
+        `border-radius:6px;color:#d98b00">🔖 ${esc(m.title || m.cid)}</div>`).join('');
+    if (list.innerHTML !== html) list.innerHTML = html;
+  }
+
   // 站点自己那排书籍标签（原创小说 – BL – 完结 – …）所在的那一行
   function siteTagLine() {
     const as = document.querySelectorAll('.article-body a[href*="/tag/"]');
@@ -3119,7 +3194,7 @@
      * 那两处是页面的骨架，标签一多就把标题挤到下一行去了。
      * 找不到那排标签（改版之类）才退回挂在书名后面。
      */
-    const badge = bookBadgeHTML(b);
+    const badge = bookBadgeHTML(b, false, true);
     const crumbs = document.querySelectorAll(FW.SEL.bookCrumb(Page.bid));
     const line = siteTagLine();
     if (line) {
@@ -3144,6 +3219,7 @@
           ? link(`data-fw-queue="${esc(Page.bid)}" data-on="1"`, '📌 已在接下来看')
           : link(`data-fw-queue="${esc(Page.bid)}"`, '📌 接下来看'));
       if (box.innerHTML !== html) box.innerHTML = html;
+      paintBmkList(box);
     } else {
       /*
        * 没有站点标签行（纯目录列表页就没有）。这时候标题上**不写进度** ——
@@ -3284,11 +3360,13 @@
       if (bar.innerHTML !== html) bar.innerHTML = html;
 
       /*
-       * 章末再放一条一模一样的标记条 —— 读完一章人就在末尾，
-       * 想标「精彩」、加书签，不该还得滚回章首。
+       * 章末再放一条：读完一章人就在末尾，想标「精彩」、加书签、打开「我的标记」，
+       * 不该还得滚回章首。进度不放（章首那条有就够了）；
        * 「✓ 我读完了」只放在这儿（最后一章才有）：读完那一刻人就在末尾。
        */
-      const endHTML = html + lastBtnHTML(ch);
+      const endHTML = markBarHTML(ch, '') + lastBtnHTML(ch) +
+        `<span data-fw-open="all" style="display:inline-block;margin:0 3px;padding:2px 11px;` +
+        `border-radius:11px;cursor:pointer;background:#8881;color:#999">📑 我的标记</span>`;
       let end = ch.el.querySelector(':scope [data-fw-end="' + ch.pid + '"]');
       if (!end) {
         end = document.createElement('div');
@@ -3394,7 +3472,8 @@
   document.addEventListener('click', (e) => {
     const t = e.target instanceof Element
       ? e.target.closest('[data-fw-mark],[data-fw-bmk],[data-fw-open],[data-fw-jump],' +
-        '[data-fw-done],[data-fw-progdel],[data-fw-queue]') : null;
+        '[data-fw-done],[data-fw-progdel],[data-fw-queue],[data-fw-bmklist],' +
+        '[data-fw-bmkjump]') : null;
     if (!t) return;
     e.preventDefault(); e.stopPropagation();
 
@@ -3416,6 +3495,18 @@
      * 最后一章末尾的「✓ 我读完了」：进度补成 100%、标上已读完，然后回书籍主页。
      * 补 100% 是故意的 —— 说读完了就别让进度还停在 93% 上刺眼。
      */
+    // 详情页 🔖n：展开 / 收起书签清单；点清单里的一条就跳过去（落在那一章开头）
+    if (t.hasAttribute('data-fw-bmklist')) {
+      bmkOpen = !bmkOpen;
+      paintAll();
+      return;
+    }
+    if (t.hasAttribute('data-fw-bmkjump')) {
+      const m = DB.d.bmks[t.getAttribute('data-fw-bmkjump')];
+      if (m && !m.deleted) jumpTo({ bid: m.bid, cid: m.cid, title: m.title, url: m.url });
+      return;
+    }
+
     if (t.hasAttribute('data-fw-queue')) {
       const on = !t.getAttribute('data-on');
       const bid = t.getAttribute('data-fw-queue');
@@ -3482,7 +3573,8 @@
      */
     const isOurs = (n) => n.nodeType === 1 && (n.id === '__fw_marks__' || (n.dataset &&
       (n.dataset.fwBadge || n.dataset.fwBar || n.dataset.fwRows ||
-       n.dataset.fwStrip || n.dataset.fwActions || n.dataset.fwNav)));
+       n.dataset.fwStrip || n.dataset.fwActions || n.dataset.fwNav ||
+       n.dataset.fwMeta || n.dataset.fwEnd || n.dataset.fwBmks)));
     const inOurs = (n) => {
       for (let e = n; e; e = e.parentElement) if (isOurs(e)) return true;
       return false;

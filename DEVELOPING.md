@@ -38,7 +38,7 @@ python3 test/run-test.py
 
 === 单章固定链接页 ===           === 收藏 / 首页 / 频道 / 索引 ===
   ✅ 只认出 1 章（回帖没被算进来） ✅ 书名后挂上了标签
-206/206 通过
+220/220 通过
 ```
 
 覆盖的页面：首页、收藏、文库、书籍介绍、纯目录列表、正文、单章固定链接、
@@ -64,7 +64,7 @@ python3 test/run-test.py
 `?fwtest=<mode>` 是给断言脚本切场景用的：`strip` / `landing` / `scroll` / `legacy` /
 `dupbmk` / `progcleared` / `ratecleared` / `upd` / `crosstab` / `cidsowned` / `tagclick` /
 `lastchap` / `postrec` / `cloudprog` / `dark` / `discard`（编辑框不点「写好了」就关 + 点背景关面板）/
-`queuetoggle` / `dequeue` / `listprog`（列表页上每本书都带进度，截图看位置用）/
+`queuetoggle` / `dequeue` / `bmklist` / `drag` / `listprog`（列表页上每本书都带进度，截图看位置用）/
 `openpanel`（面板开着不关，截图用）。截图时 `dark` 再带 `&keep&panel` 就是黑着并开着面板。
 
 断言脚本要碰内部对象时用 `window.__fw`（`{ DB, Sync }`）。这个挂钩**只在
@@ -313,6 +313,12 @@ const steps = [['mig1','_mig1'], ['mig2','_mig2'], ['mig3','_mig3'],
 
 > 回归测试：`?fwtest=crosstab`（直接改存储假装另一个标签页写过，再触发本页写入），
 > 外加一条静态检查盯住 `_flush()` 里必须有 `mergeStored`。
+
+### 书单的分组只有一份
+
+「我的标记」现在只有一张书单（原来的书签 tab、书评 tab 都并进来了）。
+哪本书在哪一组由 `shelf()` 一处算 —— 画列表用它，分组标题上的 🔄（`checkUpdates(group)`）
+也用它，保证「点在读的 🔄」查的就是你眼前那几本。
 
 ### 编辑框是草稿
 
