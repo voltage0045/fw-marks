@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.14.1
+// @version      1.15.0
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -12,7 +12,7 @@
 // @match        *://*.sosadfun.com/*
 // @updateURL    https://raw.githubusercontent.com/voltage0045/fw-marks/main/fw-marks.meta.js
 // @downloadURL  https://raw.githubusercontent.com/voltage0045/fw-marks/main/fw-marks.user.js
-// @run-at       document-idle
+// @run-at       document-start
 // @inject-into  auto
 // @grant        GM.setValue
 // @grant        GM.getValue
@@ -39,6 +39,62 @@
    */
   if (document.documentElement.dataset.fwMarksLoaded) return;
   document.documentElement.dataset.fwMarksLoaded = '1';
+
+  /*
+   * ---- 黑夜模式 ----
+   * 思路：先把**所有**元素的底色清成透明、字一律调亮，再给少数需要底色的
+   * （按钮、徽章、输入框、下拉菜单、面板）单独补上深色。
+   * 比一个个去认「哪些块是白底」稳得多 —— 站点改版多出个白底容器也照样变黑。
+   * 带内联 style 指定了颜色的元素一律不碰（:not([style*=…])）：
+   * 作者在正文里自己上的色、还有我们自己画的那些彩色小条，都原样保留。
+   *
+   * 脚本是 document-start 注入的，就为了这一步能赶在页面画出来之前套上 ——
+   * 不然夜里每开一页都先白闪一下。开没开记在 localStorage 里（同步读得到），
+   * 等数据加载完再以设置为准校正一次。
+   */
+  const DARK_KEY = '__fwm__dark';
+  const DARK_CSS = `
+    html, body { background-color: #141416 !important; }
+    html body *:not([style*="background"]) { background-color: transparent !important; }
+    html body *:not([style*="color"]) { color: #cfcfd4 !important; border-color: #2f2f35 !important; }
+    html body a:not([style*="color"]) { color: #a9bde6 !important; }
+    /* 顶栏、书名在白天就是普通深色字，黑夜里也别变成链接蓝 */
+    html body header a:not([style*="color"]), html body .navbar a:not([style*="color"]),
+    html body a.font-1:not([style*="color"]), html body a.bigger-5:not([style*="color"]),
+    html body a.bigger-10:not([style*="color"]) { color: #e4e4e8 !important; }
+    html body .grayout:not([style*="color"]), html body .text-muted:not([style*="color"]),
+    html body small:not([style*="color"]) { color: #8b8b93 !important; }
+    html body .panel:not([style*="background"]) { background-color: #1b1b1e !important; }
+    html body .btn:not([style*="background"]) { background-color: #2c2c32 !important; }
+    html body .btn:not([style*="color"]) { color: #e2e2e6 !important; }
+    html body .badge:not([style*="background"]) { background-color: #33333a !important; }
+    html body .dropdown-menu:not([style*="background"]),
+    html body .modal-content:not([style*="background"]),
+    html body .popover:not([style*="background"]) { background-color: #202024 !important; }
+    html body input:not([style*="background"]), html body textarea:not([style*="background"]),
+    html body select:not([style*="background"]) { background-color: #202024 !important; }
+    html body header:not([style*="background"]),
+    html body .navbar:not([style*="background"]) { background-color: #0c0c0e !important; }
+    html body ::placeholder { color: #6e6e76 !important; }
+    html body img { filter: brightness(.88); }
+  `;
+  function darkStyle(on) {
+    let st = document.getElementById('__fw_dark__');
+    if (on && !st) {
+      st = document.createElement('style');
+      st.id = '__fw_dark__';
+      st.textContent = DARK_CSS;
+      (document.head || document.documentElement).appendChild(st);
+    } else if (!on && st) {
+      st.remove();
+    }
+  }
+  try { if (localStorage.getItem(DARK_KEY) === '1') darkStyle(true); } catch (e) {}
+
+  // 剩下的事都要等 DOM 好了再做
+  if (document.readyState === 'loading') {
+    await new Promise((r) => document.addEventListener('DOMContentLoaded', r, { once: true }));
+  }
 
   // <title> 里这些后缀不是书名的一部分
   const FW_PAGE_SUFFIX = /[-－—]\s*(目录列表|章节目录|目录|评荐列表|回帖列表)\s*$/;
@@ -144,6 +200,7 @@
         davUrl: '',                  // 旧版的单文件地址，只用来读一次老数据
         davUser: '', davPass: '',
         autoSync: true,
+        dark: false,                 // 黑夜模式（只记在本机，每台设备各自定）
       }, this.d.cfg || {});
       this.d.lastSync = this.d.lastSync || 0;
       this.d.status = this.d.status || {}; // { repo: {ok,ts,err}, dav: {...} }
@@ -156,7 +213,7 @@
     migrate() {
       const steps = [['mig1', '_mig1'], ['mig2', '_mig2'], ['mig3', '_mig3'],
                      ['mig4', '_mig4'], ['mig5', '_mig5'], ['mig6', '_mig6'],
-                     ['mig7', '_mig7']];
+                     ['mig7', '_mig7'], ['mig8', '_mig8']];
       let n = 0, ran = false;
       for (const [flag, fn] of steps) {
         if (this.d[flag]) continue;
@@ -200,6 +257,17 @@
         const alive = this.prog(b.id) || this.bmksOf(b.id).length ||
           this.chapsOf(b.id).length || (b.tags || []).length || b.review;
         if (alive) { b.deleted = false; b.updatedAt = now(); n++; }
+      }
+      return n;
+    },
+
+    // v1.15：进度补上 chapAt（换章时间）。老记录没有它，就当是 updatedAt 那会儿换的。
+    // 只是补个字段、不是修坏数据，所以返回 0 —— 不然会弹「修好了 N 条」吓人
+    _mig8() { this.ensureChapAt(); return 0; },
+    ensureChapAt() {
+      let n = 0;
+      for (const p of Object.values(this.d.prog)) {
+        if (p && p.chapAt == null) { p.chapAt = p.updatedAt || 0; n++; }
       }
       return n;
     },
@@ -446,12 +514,26 @@
         (p && !p.deleted && p.updatedAt) || 0,
       );
     },
+    /*
+     * chapAt = 「读到哪一章」最后一次变的时间。和 updatedAt 分开记：
+     * 云端只存到「第几章」（见 Sync.progForCloud），它的时间戳就用 chapAt ——
+     * 于是同一章里滚来滚去只动本机，不会每滚一下就往云端推一次。
+     */
     setProg(bid, pos) {
       if (!bid || !pos) return null;
-      const p = Object.assign({}, this.d.prog[bid], pos, { bid, deleted: false });
+      const old = this.d.prog[bid];
+      const p = Object.assign({}, old, pos, { bid, deleted: false });
+      if (!old || old.deleted || old.cid !== p.cid) p.chapAt = now();
       this.d.prog[bid] = p;
       this.touch(p);
       return p;
+    },
+    clearProg(bid) {
+      const p = this.prog(bid);
+      if (!p) return;
+      p.deleted = true;
+      p.chapAt = now();
+      this.touch(p);
     },
     chap(bid, cid, create) {
       if (!bid || !cid) return null;
@@ -748,7 +830,45 @@
     // 每个文件当前该长什么样。凭据永远不在里面（白名单式）
     fileBody(name) {
       if (name === 'meta.json') return { v: 1, tagPool: DB.d.tagPool, site: DB.d.site };
-      return { v: 1, data: DB.d[name.replace(/\.json$/, '')] || {} };
+      const k = name.replace(/\.json$/, '');
+      if (k === 'prog') {
+        const out = {};
+        for (const id in DB.d.prog) out[id] = this.progForCloud(DB.d.prog[id]);
+        return { v: 1, data: out };
+      }
+      return { v: 1, data: DB.d[k] || {} };
+    },
+
+    /*
+     * 云端的进度**只到「第几章」**：章内读到百分之几、那句定位原文都只留在本机。
+     * 换设备接着读时落在那一章的开头，够用了；章内位置每滚一下都在变，
+     * 同步它只会让 prog.json 推个没完。时间戳用 chapAt（换章的时间），
+     * 所以只在真换了章时这个文件才会变、才会推。
+     */
+    progForCloud(p) {
+      return {
+        bid: p.bid, cid: p.cid, title: p.title || '', url: p.url || '',
+        no: p.no == null ? null : p.no, deleted: !!p.deleted,
+        updatedAt: p.chapAt || p.updatedAt || 0,
+      };
+    },
+
+    /*
+     * 云端进度合进本机。比的是「换章时间」：云端换章更晚才采纳。
+     * 采纳时如果还是本机这一章，**留着本机的章内位置**；换了章就从章首开始。
+     */
+    mergeProg(local, remote) {
+      const out = Object.assign({}, local);
+      for (const k in remote) {
+        const r = remote[k], l = out[k];
+        if (!r || typeof r !== 'object') continue;
+        const lAt = l ? (l.chapAt || l.updatedAt || 0) : -1;
+        if ((r.updatedAt || 0) <= lAt) continue;
+        const same = l && !l.deleted && !r.deleted && l.cid === r.cid;
+        out[k] = Object.assign({}, same ? l : {}, r,
+          { chapAt: r.updatedAt, updatedAt: now() });
+      }
+      return out;
     },
     fileText(name) { return this.stable(this.fileBody(name)); },
 
@@ -771,7 +891,9 @@
       }
       const k = name.replace(/\.json$/, '');
       if (!COLLECTIONS.includes(k)) return;
-      DB.d[k] = this.mergeMap(DB.d[k], obj.data || {});
+      DB.d[k] = k === 'prog'
+        ? this.mergeProg(DB.d.prog, obj.data || {})
+        : this.mergeMap(DB.d[k], obj.data || {});
     },
 
     // v1.7 及以前的整包格式（云端老文件、以及「粘贴导入」都走这里）
@@ -785,6 +907,7 @@
     // 合并完统一做的收尾
     afterMerge() {
       DB.migrateLegacyProgress();   // 老设备推上来的进度还塞在书记录里
+      DB.ensureChapAt();            // 老设备推上来的进度还没有换章时间
       DB.dedupeBmks();              // 两台设备在同一位置各加过书签
     },
 
@@ -1033,6 +1156,7 @@
     type: 'other',  // 'catalog' | 'chapter' | 'list' | 'other'
     bid: null, cid: null, title: '', bookTitle: '',
     contentEl: null, chapterLinks: [],
+    single: false,     // 是不是单章页（只有单章页才记进度）
     chapters: [],      // 正文页上的所有章节块
     native: false,     // true = 命中废文网适配器，false = 走通用启发式
 
@@ -1109,6 +1233,7 @@
     // ---- 废文网专用识别 ----
     detectNative(r) {
       this.type = r.type;
+      this.single = !!r.pid;      // 单章页（/posts/{id}）；false = 论坛模式
       this.bookTitle = FW.bookTitle(r.tid);
 
       if (r.type === 'catalog') {
@@ -1251,6 +1376,12 @@
   const Progress = {
     capture() {
       if (Page.type !== 'chapter' || !Page.bid || !Page.cid) return null;
+      /*
+       * 只在**单章页**（/posts/{id}）记进度。/threads/{id} 是「论坛模式」——
+       * 一页好几章还夹着回帖，人在那儿多半是翻评论，不是在读；
+       * 在那儿滚两下就把进度挪走，会把真正读到的位置冲掉。
+       */
+      if (Page.native && !Page.single) return null;
       return capturePos(Page.cid);
     },
     record() {
@@ -1495,6 +1626,10 @@
   /* 书名后面那支铅笔：点开才展开编辑块，收着的时候一个字都不占 */
   .pen { cursor: pointer; margin-left: 5px; font-size: 12px; opacity: .75;
     vertical-align: middle; }
+  /* 进度 tab 的分组标题，点一下收起 / 展开 */
+  .grp { margin: 16px 0 6px; font-size: 12px; color: #8e8e93; cursor: pointer;
+    -webkit-user-select: none; user-select: none; }
+  .grp .n { margin-left: 4px; color: #aeaeb2; }
   .rvbox { margin-top: 8px; border-top: 1px dashed #e5e5e7; padding-top: 8px; }
   .rvbox .tags { margin-bottom: 2px; }
   .rvbox .t { font-size: 12px; padding: 4px 9px; }
@@ -1574,11 +1709,34 @@
   .hint { font-size: 11.5px; color: #8e8e93; line-height: 1.65; margin-top: 7px; }
   .hint code { background: #f0f0f2; padding: 1px 4px; border-radius: 3px; font-size: 11px; }
   .empty { text-align: center; color: #aeaeb2; font-size: 13px; padding: 34px 0; }
+
+  /* 黑夜模式下面板自己也得暗下来（面板在 shadow DOM 里，页面那套深色管不到它） */
+  :host(.dark) .sheet { background: #1c1c1f; color: #e0e0e3; box-shadow: 0 -4px 24px rgba(0,0,0,.6); }
+  :host(.dark) .sheet header { border-bottom-color: #2e2e33; }
+  :host(.dark) .book { border-color: #2e2e33; }
+  :host(.dark) .book .rv,
+  :host(.dark) textarea, :host(.dark) input[type=text], :host(.dark) input[type=password] {
+    background: #26262a; color: #e0e0e3; border-color: #3a3a40; }
+  :host(.dark) .btn.g, :host(.dark) .tabs button, :host(.dark) .tags .t {
+    background: #2c2c31; color: #d0d0d4; }
+  :host(.dark) .tags .t.add { background: transparent; border-color: #4a4a50; color: #9a9aa0; }
+  :host(.dark) .tags .t.on { background: #4a2422; color: #ff8a80; border-color: #e8554e; }
+  :host(.dark) .tabs button.on { background: #e8554e; color: #fff; }
+  :host(.dark) .hint, :host(.dark) .book .meta, :host(.dark) .empty,
+  :host(.dark) .sheet header .sub, :host(.dark) .grp { color: #8e8e96; }
+  :host(.dark) .hint code { background: #2c2c31; }
+  :host(.dark) .chaplist a, :host(.dark) .bmk .go { color: #9ab4e6; }
+  :host(.dark) .chaplist a, :host(.dark) .bmk { border-bottom-color: #2a2a2f; }
+  :host(.dark) .chaplist, :host(.dark) .bmklist, :host(.dark) .rvbox { border-top-color: #333; }
+  :host(.dark) .sw { background: #48484f; }
+  :host(.dark) .sw.on { background: #34a853; }
 </style>
 
 <div class="mask"></div>
 <div class="sheet">
-  <header><h3></h3><span class="sub"></span><button class="btn g sm cls">关闭</button></header>
+  <header><h3></h3><span class="sub"></span>
+    <button class="btn g sm moon" title="黑夜模式">🌙</button>
+    <button class="btn g sm cls">关闭</button></header>
   <div class="body"></div>
 </div>
 <div class="toast"></div>
@@ -1608,17 +1766,40 @@
   }
   const esc = (s) => (s || '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-  // 'ctx' = 当前这本书 | 'all' = 我的标记 | 'cfg' = 同步设置
+  // 'ctx' = 当前这本书 | 'all' = 我的标记 | 'cfg' = 设置
   let view = 'ctx';
   function openSheet(v) { view = v || 'ctx'; render(); mask.classList.add('on'); sheet.classList.add('on'); }
   function closeSheet() {
     mask.classList.remove('on'); sheet.classList.remove('on');
-    editing = null;    // 下次打开不要还挂着上次那个展开的编辑框
+    editing = null; frozen = null;    // 下次打开不要还挂着上次那个展开的编辑框
   }
   // 页面上各处入口统一走这里
   function openView(v) { openSheet(v === 'book' ? 'ctx' : v); }
   mask.onclick = closeSheet;
   $('.cls').onclick = closeSheet;
+  // 面板头上那个 🌙：随手切黑夜 / 白天，不用钻进设置
+  $('.moon').onclick = () => {
+    setDark(!DB.d.cfg.dark);
+    toast(DB.d.cfg.dark ? '黑夜模式开了喵 🌙' : '黑夜模式关了');
+    if (view === 'cfg') render();
+  };
+  /*
+   * 开 / 关黑夜模式：页面那张样式表、面板的 .dark、还有给下次开页面
+   * 「抢在画出来之前」用的那个 localStorage 标记，三处一起改。
+   */
+  function setDark(on) {
+    DB.d.cfg.dark = !!on;
+    DB.save();
+    applyDark();
+  }
+  function applyDark() {
+    const on = !!DB.d.cfg.dark;
+    darkStyle(on);
+    host.classList.toggle('dark', on);
+    try { localStorage.setItem(DARK_KEY, on ? '1' : '0'); } catch (e) {}
+  }
+  applyDark();
+
   function refreshUI() { if (sheet.classList.contains('on')) render(); paintAll(); }
 
   // ==========================================================================
@@ -1642,7 +1823,7 @@
     return `<div class="btns" style="margin-top:18px">
       ${extra}
       <button class="btn g" data-go="all">📚 我的标记</button>
-      <button class="btn g" data-go="cfg">⚙️ 同步设置</button>
+      <button class="btn g" data-go="cfg">⚙️ 设置</button>
     </div>`;
   }
 
@@ -1673,7 +1854,7 @@
     sTitle.textContent = '没认出这一页';
     sSub.textContent = '';
     sBody.innerHTML = `<div class="empty">没能从网址里认出${what}编号喵。<br><br>
-      去这本书的<b>目录页</b>，从「⚙️ 同步设置」里点<b>重新校准</b>，<br>再点一下任意章节链接就能教会本喵。</div>${navBtns()}`;
+      去这本书的<b>目录页</b>，从「⚙️ 设置」里点<b>重新校准</b>，<br>再点一下任意章节链接就能教会本喵。</div>${navBtns()}`;
   }
 
   // ---- 书签列表（书籍面板 / 我的标记 两处共用）----
@@ -1728,7 +1909,7 @@
       <div class="btns"><button class="btn" data-act="saveBook">保存</button></div>
       ${navBtns()}
       <div class="hint">目录里每章标题后面会直接显示你打的标签喵。<br>
-        角标位置不对的话，去「⚙️ 同步设置」点<b>重新校准</b>，再指认一次章节链接。</div>
+        角标位置不对的话，去「⚙️ 设置」点<b>重新校准</b>，再指认一次章节链接。</div>
     `;
   }
 
@@ -1737,11 +1918,21 @@
   let searchKw = '';
   // 三件事用法完全不同：书签是「回到某处」，进度是「接着读」，书评是「这书怎么样」。
   // 所以拆成三个 subtab，搜索框在当前 tab 内生效
-  const ALL_TABS = [['prog', '▶ 进度'], ['bmk', '🔖 书签'], ['rate', '⭐ 书评']];
+  /*
+   * 书评原来单独一个 tab，现在并进「进度」：一本书读到哪、读完没、怎么评的，
+   * 本来就是同一张卡片上的事，分两处看反而要来回切。
+   */
+  const ALL_TABS = [['prog', '▶ 进度'], ['bmk', '🔖 书签']];
   let allTab = 'prog';   // 默认看进度：进来最常想知道的是「上次读到哪」
   // 哪本书的「✏️ 写书评 / 打标签」编辑框是展开的（一次只开一个）。
   // 存成状态而不是直接 toggle class：点标签会重绘列表，重绘完得还开着
   let editing = null;
+  /*
+   * 编辑框开着的那本书，**分组和排序都定格在打开那一刻** ——
+   * 不然在编辑框里点了「弃坑」，卡片当场就跳到最底下的弃坑组去了，
+   * 人还没写完。点「写好了」（或者收起编辑框）才重新归类。
+   */
+  let frozen = null;     // { bid, group, key }
 
   function renderAll(kw) {
     if (kw !== undefined) searchKw = kw;
@@ -1774,8 +1965,7 @@
     if (!box) return;
     const kw = (searchKw || '').toLowerCase();
     if (allTab === 'bmk') return paintBmkTab(box, kw);
-    if (allTab === 'prog') return paintProgTab(box, kw);
-    return paintRateTab(box, kw);
+    return paintProgTab(box, kw);
   }
 
   // ---- 书名后面那支铅笔，和它展开的编辑块 ----
@@ -1797,6 +1987,7 @@
         placeholder="这本书读下来感觉如何…（边写边存）">${esc(b.review)}</textarea>
       <div class="btns" style="margin-top:6px">
         <button class="btn sm" data-pendone="${esc(b.id)}">写好了</button>
+        <button class="btn g sm" data-ratedel="${esc(b.id)}">清空书评、标签和章节标记</button>
       </div>
     </div>`;
   }
@@ -1808,19 +1999,6 @@
 
   const tagPills = (b) => (b.tags || [])
     .map((t) => `<span class="pill" style="background:#5a6b8c">${esc(t)}</span>`).join('');
-
-  /*
-   * 书评 tab 里书名后那个状态小标（不跳转）。
-   * **弃坑不在这儿显示** —— 它是靠「弃坑」这个标签判出来的，而标签就并排挂在
-   * 旁边，再标一次就是同一件事说两遍。弃坑的归类留给进度 tab。
-   */
-  function progTagHTML(b) {
-    const p = DB.prog(b.id);
-    if (!p || DB.isDropped(b.id)) return '';
-    if (DB.isFinished(b.id)) return '<span class="pill" style="background:#34a853">✓ 已读完</span>';
-    const txt = p.no && b.chapTotal ? `${p.no}/${b.chapTotal}` : '在读';
-    return `<span class="pill" style="background:#5a6b8c">▶ ${txt}</span>`;
-  }
 
   // ---- tab 1：书签 ----
   function paintBmkTab(box, kw) {
@@ -1844,69 +2022,71 @@
       : emptyBox(kw, '还没有书签喵～<br>读正文时点章节下面那个 🔖');
   }
 
-  // ---- tab 2：阅读进度 ----
+  // ---- tab：进度（连同书评、标签、章节标记）----
   /*
-   * 列的是**进度记录本身**，不是「书里有进度的那些」—— 书记录和进度是两张表，
-   * 书记录可能还没建或者被软删过（出过这个问题：详情页显示着「上次读到」，
-   * 我的标记里却一本都没有）。拿不到书记录就用个占位名字，照样能继续读。
+   * 列的是**进度记录 + 评过的书**的并集：有进度的按进度归组，
+   * 没进度但打过标签 / 写过书评 / 标过章节的也得有地方放（书评 tab 并进来之前它们在那儿）。
+   * 从 prog 表出发而不是从书出发 —— 书记录可能还没建或被软删过，
+   * 那样的进度照样得列出来（出过「详情页有进度、我的标记里没有」的事）。
    *
-   * 排序按**进度自己的 updatedAt**，不用 lastActive —— 后者会被「查了一次新章」
-   * 这类跟阅读无关的改动顶上去，点一下刷新顺序就全乱了。
+   * 分组：在读 → 读完了 → 没进度 → 弃坑。后三组能收起来（记在本机设置里）。
+   * 在读按「最近读」排（进度自己的 updatedAt），不用 lastActive ——
+   * 后者会被「查了一次新章」这类跟阅读无关的改动顶上去。
    */
+  const GROUPS = [
+    ['reading', '在读'], ['finished', '读完了'], ['none', '没有进度'], ['dropped', DROP_TAG],
+  ];
+
+  function groupOf(b, p) {
+    if (DB.isDropped(b.id)) return 'dropped';   // 弃坑优先：坑都弃了，读到哪无所谓
+    if (!p) return 'none';
+    return DB.isFinished(b.id) ? 'finished' : 'reading';
+  }
+
+  // 打开编辑框那一刻，记下这本书当时在哪一组、按什么排 —— 关掉之前都按它摆
+  function freezeFor(bid) {
+    frozen = null;
+    if (!bid) return;
+    const b = DB.book(bid, false) || { id: bid, tags: [], updatedAt: 0 };
+    const p = DB.prog(bid);
+    frozen = { bid, group: groupOf(b, p), key: p ? (p.updatedAt || 0) : (b.updatedAt || 0) };
+  }
+
   function paintProgTab(box, kw) {
-    const reading = [], finished = [], dropped = [];
+    const seen = new Set();
+    const items = [];
+    const add = (b, p) => {
+      if (seen.has(b.id)) return;
+      seen.add(b.id);
+      const cs = DB.chapsOf(b.id).filter((c) => c.mark || c.note);
+      const hit = !kw || [b.title, p && p.title, b.review, ...(b.tags || []),
+        ...cs.map((c) => (c.title || '') + (c.note || ''))]
+        .some((x) => (x || '').toLowerCase().includes(kw));
+      if (!hit) return;
+      let group = groupOf(b, p);
+      let key = p ? (p.updatedAt || 0) : (b.updatedAt || 0);
+      if (frozen && frozen.bid === b.id) { group = frozen.group; key = frozen.key; }
+      items.push({ b, p, cs, group, key });
+    };
     for (const p of Object.values(DB.d.prog)) {
       if (!p || p.deleted || !p.bid) continue;
-      const b = DB.book(p.bid, false) || { id: p.bid, title: '', tags: [], review: '' };
-      if (kw && !((b.title || '') + (p.title || '')).toLowerCase().includes(kw)) continue;
-      // 弃坑优先于读完：坑都弃了，它读到第几章已经无所谓了
-      (DB.isDropped(p.bid) ? dropped
-        : DB.isFinished(p.bid) ? finished : reading).push([b, p]);
+      add(DB.book(p.bid, false) || { id: p.bid, title: '', tags: [], review: '' }, p);
     }
-    const byRead = (x, y) => (y[1].updatedAt || 0) - (x[1].updatedAt || 0);
-    [reading, finished, dropped].forEach((g) => g.sort(byRead));
+    for (const b of DB.liveBooks()) {
+      const rated = (b.tags || []).length || b.review ||
+        DB.chapsOf(b.id).some((c) => c.mark || c.note);
+      if (rated || editing === b.id) add(b, null);
+    }
+    items.sort((x, y) => y.key - x.key);
 
-    // 「第几章/共几章」里的总数是**上次数目录时**的，不是实时的
-    // （正文页上算不出全书章节数）。所以标「有新章」而不是「有更新」，别把话说满
-    /*
-     * 「在读」之外那两组（读完了 / 弃坑）不显示章节进度也不显示查章节的时间 ——
-     * 都收尾了，还盯着「9/9」和「什么时候数过目录」没意义，只占地方。
-     */
-    const row = ([b, p], kind) => {
-      const live = kind === 'reading';
-      const pct = Math.round((p.cpct || p.pct || 0) * 100);
-      const no = p.no, total = b.chapTotal;
-      const hasNew = live && no && total && no < total;
-      const at = live ? (b.chapCheckedAt || b.chapSeenAt) : 0;
-      return `<div class="book" data-bid="${esc(b.id)}">
-        <div class="bt">${bookName(b)}
-          ${live && no && total ? `<span class="pill" style="background:#5a6b8c">${no}/${total}</span>` : ''}
-          ${hasNew ? `<span class="pill" style="background:#e8554e">▲ 有新章 ${total - no}</span>` : ''}
-          ${kind === 'finished' ? '<span class="pill" style="background:#34a853">✓ 读完</span>' : ''}
-          ${kind === 'dropped' ? `<span class="pill" style="background:#9aa0a6">${DROP_TAG}</span>` : ''}
-          ${penHTML(b.id)}
-          ${at ? `<span class="when" title="上次数章节的时间">🕘 ${when(at)}</span>` : ''}
-        </div>
-        <div class="meta one">▶ 读到「${esc(p.title || '某一章')}」 ${pct}%</div>
-        ${rvBoxHTML(b)}
-        <div class="btns" style="margin-top:8px">
-          <button class="btn sm" data-jump="${esc(p.url || '')}">继续读</button>
-          <button class="btn g sm" data-jump="${esc(DB.bookUrl(b.id))}">去目录</button>
-          <button class="btn g sm" data-doneread="${esc(b.id)}"
-            data-on="${b.doneRead ? '1' : ''}">${b.doneRead ? '没读完' : '已读完'}</button>
-          <button class="btn g sm" data-progdel="${esc(b.id)}">清除进度</button>
-        </div>
-      </div>`;
-    };
-
-    sSub.textContent = [
-      reading.length ? `${reading.length} 本在读` : '',
-      finished.length ? `${finished.length} 本读完` : '',
-      dropped.length ? `${dropped.length} 本弃坑` : '',
-    ].filter(Boolean).join(' · ');
+    const fold = DB.d.cfg.fold || {};
+    const count = (g) => items.filter((x) => x.group === g).length;
+    const short = { reading: '在读', finished: '读完', none: '没进度', dropped: DROP_TAG };
+    sSub.textContent = GROUPS.map(([g]) => (count(g) ? `${count(g)} 本${short[g]}` : ''))
+      .filter(Boolean).join(' · ');
 
     const parts = [];
-    if (reading.length) {
+    if (count('reading')) {
       parts.push(`<div class="btns" style="margin-bottom:6px">
         <button class="btn g sm" data-act="chkupd">🔄 查一下有没有新章</button>
       </div>
@@ -1915,72 +2095,65 @@
         只查<b>在读</b>的书 —— 标了完结的、标过「已读完」的、打了「${DROP_TAG}」的都不查。
       </div>`);
     }
-    parts.push(...reading.map((x) => row(x, 'reading')));
-    const tail = (label, list, kind) => {
-      if (!list.length) return;
-      parts.push(`<div class="hint" style="margin:14px 0 4px">${label}</div>`);
-      parts.push(...list.map((x) => row(x, kind)));
-    };
-    tail('读完了', finished, 'finished');
-    tail(DROP_TAG, dropped, 'dropped');
+    for (const [g, label] of GROUPS) {
+      const list = items.filter((x) => x.group === g);
+      if (!list.length) continue;
+      if (g !== 'reading') {
+        // 收起来的组只留一行标题，点一下再展开
+        parts.push(`<div class="grp" data-fold="${g}">${fold[g] ? '▸' : '▾'} ${esc(label)}
+          <span class="n">${list.length}</span></div>`);
+        if (fold[g]) continue;
+      }
+      parts.push(...list.map((x) => progCardHTML(x)));
+    }
     box.innerHTML = parts.length ? parts.join('')
       : emptyBox(kw, '还没有阅读进度喵～<br>读几章就会自动记下来');
   }
 
   /*
-   * ---- tab 3：书评 ----
-   * 只列「真的评过」的书：打过标签、写过书评、或者标过章节。光有进度不算 ——
-   * 那是进度 tab 的事，堆在这里只会把真写过的东西埋掉。
-   * 想给还没评过的书补一句：去进度 tab，点书名后那支 ✏️。
+   * 一张书的卡片。书名那一行：进度 / 有新章 / 读完 + 标签 + 章节标记数 + ✏️，
+   * 「什么时候数过章节」靠右。下面是读到哪、书评原文（收起编辑框时）、编辑框、按钮。
+   * 只有「在读」显示「第几章/共几章」和查章节时间 —— 收尾了的书还盯着 9/9 没意义。
    */
-  function paintRateTab(box, kw) {
-    const rows = [];
-    let total = 0;
-    for (const b of booksByRecent()) {
-      const cs = DB.chapsOf(b.id).filter((c) => c.mark || c.note);
-      const rated = (b.tags || []).length || b.review || cs.length;
-      // 正在写的那本先留着，不然第一个字还没打完它就自己消失了
-      if (!rated && editing !== b.id) continue;
-      total++;
-      const hit = !kw ||
-        (b.title || '').toLowerCase().includes(kw) ||
-        (b.review || '').toLowerCase().includes(kw) ||
-        b.tags.some((t) => t.toLowerCase().includes(kw)) ||
-        cs.some((c) => ((c.title || '') + (c.note || '')).toLowerCase().includes(kw));
-      if (!hit) continue;
-
-      const cnt = { good: 0, ok: 0, skip: 0 };
-      cs.forEach((c) => { if (c.mark) cnt[c.mark]++; });
-      // 标签和标记数都跟在书名后面。书评写好了就是一段纯文本，
-      // 想改再点铅笔 —— 一直摆个输入框在那儿，列表全是框，读起来累
-      rows.push(`<div class="book" data-bid="${esc(b.id)}">
-        <div class="bt">${bookName(b)}
-          ${progTagHTML(b)}
-          ${tagPills(b)}
-          ${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) =>
-            `<span class="pill" style="background:${MARKS[k].color}">${MARKS[k].label} ${v}</span>`).join('')}
-          ${penHTML(b.id)}
-        </div>
-        ${rvTextHTML(b)}
-        ${rvBoxHTML(b)}
-        <div class="btns" style="margin-top:8px">
-          <button class="btn g sm" data-jump="${esc(DB.bookUrl(b.id))}">去目录</button>
-          ${cs.length ? `<button class="btn g sm" data-toggle>标记章节 ${cs.length}</button>` : ''}
-          <button class="btn g sm" data-ratedel="${esc(b.id)}">清除书评</button>
-        </div>
-        <div class="chaplist">
-          ${cs.sort((a, c) => (c.updatedAt || 0) - (a.updatedAt || 0)).map((c) => `
-            <a href="${esc(c.url)}">
-              ${c.mark ? `<span class="pill" style="background:${MARKS[c.mark].color}">${MARKS[c.mark].label}</span>` : ''}
-              ${esc(c.title || c.cid)}
-              ${c.note ? `<span class="n">📝 ${esc(c.note)}</span>` : ''}
-            </a>`).join('')}
-        </div>
-      </div>`);
-    }
-    sSub.textContent = total ? `${total} 本评过` : '';
-    box.innerHTML = rows.length ? rows.join('')
-      : emptyBox(kw, '还没写过书评、也没打过标签喵～<br>点书名后面那支 ✏️ 就能写');
+  function progCardHTML({ b, p, cs, group }) {
+    const live = group === 'reading';
+    const no = p && p.no, total = b.chapTotal;
+    const hasNew = live && no && total && no < total;
+    const at = live ? (b.chapCheckedAt || b.chapSeenAt) : 0;
+    const cnt = { good: 0, ok: 0, skip: 0 };
+    cs.forEach((c) => { if (c.mark) cnt[c.mark]++; });
+    const pct = p ? Math.round((p.cpct || p.pct || 0) * 100) : 0;
+    return `<div class="book" data-bid="${esc(b.id)}">
+      <div class="bt">${bookName(b)}
+        ${live && no && total ? `<span class="pill" style="background:#5a6b8c">${no}/${total}</span>` : ''}
+        ${hasNew ? `<span class="pill" style="background:#e8554e">▲ 有新章 ${total - no}</span>` : ''}
+        ${group === 'finished' ? '<span class="pill" style="background:#34a853">✓ 读完</span>' : ''}
+        ${tagPills(b)}
+        ${Object.entries(cnt).filter(([, v]) => v).map(([k, v]) =>
+          `<span class="pill" style="background:${MARKS[k].color}">${MARKS[k].label} ${v}</span>`).join('')}
+        ${penHTML(b.id)}
+        ${at ? `<span class="when" title="上次数章节的时间">🕘 ${when(at)}</span>` : ''}
+      </div>
+      ${p ? `<div class="meta one">▶ 读到「${esc(p.title || '某一章')}」 ${pct}%</div>` : ''}
+      ${rvTextHTML(b)}
+      ${rvBoxHTML(b)}
+      <div class="btns" style="margin-top:8px">
+        ${p ? `<button class="btn sm" data-jump="${esc(p.url || '')}">继续读</button>` : ''}
+        <button class="btn g sm" data-jump="${esc(DB.bookUrl(b.id))}">去目录</button>
+        ${p ? `<button class="btn g sm" data-doneread="${esc(b.id)}"
+          data-on="${b.doneRead ? '1' : ''}">${b.doneRead ? '没读完' : '已读完'}</button>` : ''}
+        ${p ? `<button class="btn g sm" data-progdel="${esc(b.id)}">清除进度</button>` : ''}
+        ${cs.length ? `<button class="btn g sm" data-toggle>标记章节 ${cs.length}</button>` : ''}
+      </div>
+      ${cs.length ? `<div class="chaplist">
+        ${cs.sort((x, y) => (y.updatedAt || 0) - (x.updatedAt || 0)).map((c) => `
+          <a href="${esc(c.url)}">
+            ${c.mark ? `<span class="pill" style="background:${MARKS[c.mark].color}">${MARKS[c.mark].label}</span>` : ''}
+            ${esc(c.title || c.cid)}
+            ${c.note ? `<span class="n">📝 ${esc(c.note)}</span>` : ''}
+          </a>`).join('')}
+      </div>` : ''}
+    </div>`;
   }
 
   /*
@@ -2078,10 +2251,18 @@
         ? `<span style="color:#34a853">✅ ${t}</span>`
         : `<span style="color:#e8554e">⚠️ ${t}　${esc(s.err)}</span>`;
     };
-    sTitle.textContent = '同步设置';
+    sTitle.textContent = '设置';
     sSub.textContent = DB.d.lastSync ? '上次 ' + new Date(DB.d.lastSync).toLocaleString('zh-CN') : '尚未同步';
     sBody.innerHTML = `
-      <div class="hint" style="margin:0 0 16px;background:#f7f7f9;padding:10px;border-radius:9px">
+      <div class="row">
+        <label>🌙 黑夜模式（只记在这台设备上）
+          <span class="sw ${c.dark ? 'on' : ''}" data-dark role="switch"
+            aria-checked="${!!c.dark}"></span>
+        </label>
+        <div class="hint">网页和这个面板一起变暗。面板右上角那个 🌙 也能随手切。</div>
+      </div>
+
+      <div class="hint" style="margin:0 0 16px;background:#8881;padding:10px;border-radius:9px">
         两个云端是<b>互为备份</b>喵：同步时两边都拉下来，和本地<b>逐条比时间戳取最新</b>，
         再把合并结果推回两边——落后的那边会被自动补齐，一边挂了另一边照常用。
       </div>
@@ -2176,10 +2357,16 @@
     const t = e.target.closest('[data-act],[data-go],[data-tag],[data-jump],[data-ratedel],' +
       '[data-toggle],[data-bmkgo],[data-bmkdel],[data-bmktoggle],[data-tab],' +
       '[data-progdel],[data-backon],[data-pen],[data-pendone],[data-btag],[data-newtag],' +
-      '[data-doneread],[data-tagmgr],[data-tagren],[data-tagdel]');
+      '[data-doneread],[data-tagmgr],[data-tagren],[data-tagdel],[data-fold],[data-dark]');
     if (!t) return;
 
     // 某个云端的总开关：关掉就不参与同步，设置里也折叠起来不占地方
+    if (t.hasAttribute('data-dark')) {
+      setDark(!DB.d.cfg.dark);
+      render();
+      return;
+    }
+
     if (t.dataset.backon) {
       const k = t.dataset.backon === 'repo' ? 'repoOn' : 'davOn';
       DB.d.cfg[k] = !DB.d.cfg[k];
@@ -2194,7 +2381,7 @@
     if (t.dataset.tab) {
       flushRvBox();
       allTab = t.dataset.tab;
-      editing = null;
+      editing = null; frozen = null;
       render();
       sBody.scrollTop = 0;
       return;
@@ -2205,12 +2392,14 @@
     if (t.dataset.pen) {
       flushRvBox();
       editing = editing === t.dataset.pen ? null : t.dataset.pen;
+      freezeFor(editing);
       paintList();
       return;
     }
     if (t.dataset.pendone) {
       flushRvBox();
-      editing = null;
+      editing = null; frozen = null;
+      frozen = null;      // 写好了才重新归组：这时候点过的「弃坑」才挪过去
       paintList(); paintAll();
       toast('记下了喵 ✓');
       return;
@@ -2238,6 +2427,15 @@
       }
       return;
     }
+    // 进度 tab 里「读完了 / 没有进度 / 弃坑」三组可以收起来，记在本机设置里
+    if (t.dataset.fold) {
+      const f = DB.d.cfg.fold = DB.d.cfg.fold || {};
+      f[t.dataset.fold] = !f[t.dataset.fold];
+      DB.save();
+      paintList();
+      return;
+    }
+
     if (t.hasAttribute('data-tagmgr')) {
       flushRvBox();
       view = 'tags'; render(); sBody.scrollTop = 0;
@@ -2265,6 +2463,7 @@
 
     // 手动标「已读完 / 还没读完」。进度一点都不动，只是换个归类
     if (t.dataset.doneread) {
+      frozen = null;      // 编辑框外面的明确操作，立刻挪组
       const on = !t.dataset.on;
       DB.setDoneRead(t.dataset.doneread, on);
       toast(on ? '标成已读完了喵 ✓' : '挪回在读了');
@@ -2274,8 +2473,9 @@
 
     // 单独清掉某本书的阅读进度（书和标记都留着）
     if (t.dataset.progdel) {
+      frozen = null;
       const pg = DB.prog(t.dataset.progdel);
-      if (pg) { pg.deleted = true; DB.touch(pg); }
+      if (pg) DB.clearProg(t.dataset.progdel);
       toast('已清除这本的进度');
       render(); paintAll();
       return;
@@ -2303,7 +2503,7 @@
 
     if (t.dataset.go) {
       flushRvBox();
-      editing = null;
+      editing = null; frozen = null;
       view = t.dataset.go === 'book' ? 'ctx' : t.dataset.go;
       render();
       sBody.scrollTop = 0;
@@ -2322,7 +2522,7 @@
         b.tags = []; b.review = '';
         DB.touch(b);
         DB.chapsOf(b.id).forEach((c) => { c.deleted = true; c.updatedAt = now(); });
-        DB.save(); editing = null; render(); paintAll(); toast('已清除这本的书评');
+        DB.save(); editing = null; frozen = null; render(); paintAll(); toast('已清除这本的书评');
       });
       return;
     }
@@ -2676,19 +2876,40 @@
    * 少末尾几章，所以只在还没学过时才用它兜底 —— 不然两个页面来回覆盖，
    * 章节数会跳来跳去。
    */
+  /*
+   * 把 extra 里没见过的章节按它自己的顺序插进 base：
+   * 每个新章插在「extra 里排它前面、且 base 里已有的那一章」后面。
+   * base 里有、extra 里没有的（限阅章节）原样保留。
+   */
+  function mergeCids(base, extra) {
+    const out = base.slice();
+    let at = -1;
+    for (const id of extra) {
+      const i = out.indexOf(id);
+      if (i >= 0) { at = i; continue; }
+      out.splice(at + 1, 0, id);
+      at++;
+    }
+    return out;
+  }
+
   function learnBookMeta(cids, authoritative) {
     if (!Page.bid || !cids.length) return;
     const b = DB.book(Page.bid, false);
     if (!b) return;
     let dirty = false;
 
-    if (authoritative || !(b.cids || []).length) {
-      if (b.cids ? b.cids.join() !== cids.join() : true) { b.cids = cids; dirty = true; }
-      if (b.chapTotal !== cids.length) { b.chapTotal = cids.length; dirty = true; }
-      // 只精确到分钟：否则每次重绘都算「变了」，白触发一次保存和同步
-      const seenAt = Math.floor(now() / 60000) * 60000;
-      if (b.chapSeenAt !== seenAt) { b.chapSeenAt = seenAt; dirty = true; }
-    }
+    /*
+     * 详情页直接覆盖；目录列表页**合并**进来 ——
+     * 它会漏掉「单章限制阅读」那种章节，不能拿它覆盖；但它有新章时也得认，
+     * 不然只逛目录列表页的话，章节数永远停在上次逛详情页那会儿。
+     */
+    const next = authoritative ? cids : mergeCids(b.cids || [], cids);
+    if ((b.cids || []).join() !== next.join()) { b.cids = next; dirty = true; }
+    if (b.chapTotal !== next.length) { b.chapTotal = next.length; dirty = true; }
+    // 只精确到分钟：否则每次重绘都算「变了」，白触发一次保存和同步
+    const seenAt = Math.floor(now() / 60000) * 60000;
+    if (b.chapSeenAt !== seenAt) { b.chapSeenAt = seenAt; dirty = true; }
 
     // 章节顺序变了，进度那一章的序号也跟着重算
     const pg0 = DB.prog(Page.bid);
@@ -2870,7 +3091,15 @@
         box.style.cssText = 'margin:4px 0 0;font-size:11px;line-height:1.9';
         line.insertAdjacentElement('afterend', box);
       }
-      if (box.innerHTML !== badge) box.innerHTML = badge;
+      /*
+       * 有进度就在旁边放个「清除进度」—— 想重读、或者点错了记了一本没打算读的书，
+       * 在书的主页上就地清掉，不用再翻进「我的标记」。点了会先问一句。
+       */
+      const html = badge + (DB.prog(Page.bid)
+        ? `<span data-fw-progdel="${esc(Page.bid)}" style="margin-left:6px;` +
+          `color:#999;cursor:pointer;text-decoration:underline">清除进度</span>`
+        : '');
+      if (box.innerHTML !== html) box.innerHTML = html;
     } else {
       /*
        * 没有站点标签行（纯目录列表页就没有）。这时候标题上**不写进度** ——
@@ -2931,31 +3160,57 @@
   }
 
   /*
-   * 列表页（收藏 / 文库 / 频道 / 索引）的状态小条：**贴着一句话简介那一行、靠右浮动**。
-   * 不自己另占一行 —— 那样条目会被撑高一截；也不挂书名后面 —— 会把书名挤走。
-   * 浮动 + 短文案（第几章/共几章）两条一起做，简介才不会被顶到下一行去。
+   * 列表页（收藏 / 文库 / 频道 / 索引）的状态小条：**贴着一句话简介那一行、靠最右**。
    *
-   * 一句话简介在哪：每种列表页 class 名都不一样，但都是
-   * `article ... span.smaller-5`（里面裹着简介链接）。找不到就退回条目末尾。
+   * 一句话简介是 `span.smaller-5`，但**不是带 .pull-right 的那个** —— 那个是作者名
+   * （文库、频道页的标题行右边就是它；认错了小条就会跑到作者名旁边去）。
+   * 简介行右边要是已经有站点自己的东西（回响 / 字数），小条排在它左边。
+   * 没有简介行的页面（主题索引）返回 false，由调用方退回挂在书名后面。
    */
   function attachListRows(a, b) {
     const item = a.closest('article');
-    if (!item) return false;
-
-    const host = item.querySelector('span.smaller-5') || null;
-    const line = host ? (host.parentElement || host) : item;
+    const brief = item && item.querySelector('span.smaller-5:not(.pull-right)');
+    const line = brief && brief.parentElement;
+    let box = item && item.querySelector('[data-fw-rows]');
+    if (!line) { if (box) box.remove(); return false; }
 
     const html = statusPill(b, true);
-    let box = line.querySelector(':scope > [data-fw-rows]');
-    if (!html) { if (box) box.remove(); return !!DB.prog(b.id); }
-    if (!box) {
-      box = document.createElement('div');
+    if (!html) { if (box) box.remove(); return true; }
+    if (!box || box.parentElement !== line) {
+      if (box) box.remove();
+      box = document.createElement('span');
       box.setAttribute('data-fw-rows', '1');
       box.style.cssText = 'float:right;margin-left:6px;font-size:11px;line-height:1.9';
-      line.insertBefore(box, line.firstChild);   // 浮动元素要排在文字之前才环绕得对
+      // 浮动元素在源码里越靠前越靠右：排在站点那块之后，就落在它左边
+      const site = line.querySelector(':scope > .pull-right');
+      if (site) site.insertAdjacentElement('afterend', box);
+      else line.insertBefore(box, line.firstChild);
     }
     if (box.innerHTML !== html) box.innerHTML = html;
+    // 这一行右边已经有站点的东西（回响 / 字数）时就紧挨着它，不往最右推 ——
+    // 推过去会压在那串数字上
+    if (line.querySelector(':scope > .pull-right')) box.style.marginRight = '0px';
+    else alignRight(box, item);
     return true;
+  }
+
+  /*
+   * 把小条推到条目的最右边。
+   * 收藏页的简介行只占左边 10/12 栏（右边那 2 栏是齿轮），光浮动的话小条停在
+   * 那一栏的右沿，右边空出一大块。所以量一下差多少，用负的 margin-right 补过去 ——
+   * 对齐的是最后一栏（站点那行标签）的右沿。宽度不变就不重量，免得反复回流。
+   */
+  function alignRight(box, item) {
+    if (box.dataset.fwW === String(window.innerWidth)) return;
+    const row = item.querySelector(':scope > .row') || item;
+    const ref = [...row.children].reverse().find((x) => /\bcol-/.test(x.className));
+    if (!ref) return;
+    box.style.marginRight = '0px';
+    const want = ref.getBoundingClientRect().right -
+      parseFloat(getComputedStyle(ref).paddingRight || 0);
+    const gap = want - box.getBoundingClientRect().right;
+    box.style.marginRight = gap > 1 ? -Math.round(gap) + 'px' : '0px';
+    box.dataset.fwW = String(window.innerWidth);
   }
 
   // ---- 正文页：每章标题下面一条行内标记条 ----
@@ -2981,35 +3236,16 @@
           '-webkit-user-select:none;user-select:none';
         anchor.insertAdjacentElement('afterend', bar);
       }
-      const c = DB.chap(Page.bid, ch.pid, false);
-      const live = c && !c.deleted;
-      const cur = live ? c.mark : null;
-      // 备注已经不写了（章节内只留书签），但老数据里存量的还显示出来
-      const note = live ? c.note : '';
-      const btn = (extra, attrs, txt) =>
-        `<span ${attrs} style="display:inline-block;margin:0 3px;padding:2px 11px;border-radius:11px;cursor:pointer;${extra}">${txt}</span>`;
-      const nb = idx().bmksOfChap(Page.bid, ch.pid).length;
-      const html =
-        Object.entries(MARKS).map(([k, m]) =>
-          btn(cur === k ? `background:${m.color};color:#fff;font-weight:700` : 'background:#8881;color:#999',
-              `data-fw-mark="${k}" data-fw-pid="${ch.pid}"`, m.label)).join('') +
-        // 只放一个图标：标了是亮的、没标是灰的，一眼就分得清，不用写字
-        btn(nb ? 'background:#d98b0022;color:#d98b00;font-weight:700'
-               : 'background:#8881;color:#bbb;filter:grayscale(1)',
-            `data-fw-bmk="${ch.pid}"${nb ? ' data-fw-bmkon="1"' : ''}` +
-            ` title="${nb ? '已加书签，点一下取消' : '给这一章加书签'}"`, '🔖') +
-        (ch.pid === progOn ? progHTML : '') +
-        (note ? `<span title="${esc(note)}" style="margin-left:6px;color:#8e8e93">📝 ${esc(note.slice(0, 16))}</span>` : '') +
-        lastBtnHTML(ch);
+      const html = markBarHTML(ch, ch.pid === progOn ? progHTML : '');
       if (bar.innerHTML !== html) bar.innerHTML = html;
 
       /*
-       * 最后一章**正文末尾**再放一个。读完那一刻人就在这儿，
-       * 让人再滚回章首去按顶上那个不合理 —— 顶上那个也留着，两处都能按。
+       * 章末再放一条一模一样的标记条 —— 读完一章人就在末尾，
+       * 想标「精彩」、加书签，不该还得滚回章首。
+       * 「✓ 我读完了」只放在这儿（最后一章才有）：读完那一刻人就在末尾。
        */
-      const endHTML = lastBtnHTML(ch);
+      const endHTML = html + lastBtnHTML(ch);
       let end = ch.el.querySelector(':scope [data-fw-end="' + ch.pid + '"]');
-      if (!endHTML) { if (end) end.remove(); continue; }
       if (!end) {
         end = document.createElement('div');
         end.setAttribute('data-fw-end', ch.pid);
@@ -3020,6 +3256,28 @@
       }
       if (end.innerHTML !== endHTML) end.innerHTML = endHTML;
     }
+  }
+
+  // 一条标记条：精彩 / 一般 / 跳过 / 🔖 /（进度）。章首、章末共用
+  function markBarHTML(ch, progHTML) {
+    const c = DB.chap(Page.bid, ch.pid, false);
+    const live = c && !c.deleted;
+    const cur = live ? c.mark : null;
+    // 备注已经不写了（章节内只留书签），但老数据里存量的还显示出来
+    const note = live ? c.note : '';
+    const btn = (extra, attrs, txt) =>
+      `<span ${attrs} style="display:inline-block;margin:0 3px;padding:2px 11px;border-radius:11px;cursor:pointer;${extra}">${txt}</span>`;
+    const nb = idx().bmksOfChap(Page.bid, ch.pid).length;
+    return Object.entries(MARKS).map(([k, m]) =>
+        btn(cur === k ? `background:${m.color};color:#fff;font-weight:700` : 'background:#8881;color:#999',
+            `data-fw-mark="${k}" data-fw-pid="${ch.pid}"`, m.label)).join('') +
+      // 只放一个图标：标了是亮的、没标是灰的，一眼就分得清，不用写字
+      btn(nb ? 'background:#d98b0022;color:#d98b00;font-weight:700'
+             : 'background:#8881;color:#bbb;filter:grayscale(1)',
+          `data-fw-bmk="${ch.pid}"${nb ? ' data-fw-bmkon="1"' : ''}` +
+          ` title="${nb ? '已加书签，点一下取消' : '给这一章加书签'}"`, '🔖') +
+      progHTML +
+      (note ? `<span title="${esc(note)}" style="margin-left:6px;color:#8e8e93">📝 ${esc(note.slice(0, 16))}</span>` : '');
   }
 
   /*
@@ -3076,6 +3334,11 @@
     if (bar.innerHTML !== html) bar.innerHTML = html;
   }
 
+  addEventListener('resize', () => {
+    clearTimeout(paintAll._rt);
+    paintAll._rt = setTimeout(paintAll, 200);
+  });
+
   function paintAll() {
     IDX = null;                       // 这一轮重新建索引，免得读到过期数据
     injectNavEntry(); injectPageActions();
@@ -3114,7 +3377,7 @@
       const bid = t.getAttribute('data-fw-progdel');
       confirmBar('清掉这本书的阅读进度？书签和书评不动', () => {
         const p = DB.prog(bid);
-        if (p) { p.deleted = true; DB.touch(p); }
+        if (p) DB.clearProg(bid);
         toast('已清掉这本的进度');
         paintAll();
         if (sheet.classList.contains('on')) render();
@@ -3224,6 +3487,9 @@
     setTimeout(() => toast(`修好了 ${migrated} 条旧版存错的记录喵，重新读一次就会记对`, 3600), 1400);
   }
 
+  // 本机测试台专用：把内部对象挂出来给断言脚本用（真站的域名不是这俩，不会挂）
+  if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) window.__fw = { DB, Sync };
+
   const anyCloud = Object.values(Backends).some((b) => b.ready());
   if (DB.d.cfg.autoSync && anyCloud && now() - DB.d.lastSync > 5 * 60 * 1000) {
     setTimeout(() => Sync.run(true), 2500);
@@ -3250,7 +3516,9 @@
    *   storage              另一个标签页刚写过（同源 localStorage 会广播）
    */
   function pullStore() {
-    if (!DB.mergeStored(DB.stored(true))) return;
+    const changed = DB.mergeStored(DB.stored(true));
+    applyDark();          // 别的标签页切了黑夜模式，这边跟上
+    if (!changed) return;
     paintAll();
     // 正在输入的时候不重绘面板，否则光标和输入法全丢
     const ae = R.activeElement;
@@ -3258,7 +3526,14 @@
     if (!typing && sheet.classList.contains('on')) render();
   }
   addEventListener('pageshow', (e) => { if (e.persisted) pullStore(); });
-  addEventListener('storage', (e) => { if (e.key === '__fwm__db') pullStore(); });
+  addEventListener('storage', (e) => {
+    if (e.key === '__fwm__db') pullStore();
+    else if (e.key === DARK_KEY) {
+      const on = e.newValue === '1';
+      darkStyle(on);
+      host.classList.toggle('dark', on);
+    }
+  });
   addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') flush();
     else pullStore();

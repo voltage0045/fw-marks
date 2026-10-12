@@ -14,3 +14,9 @@ test/pages/
 # 系统垃圾
 .DS_Store
 /.idea/
+
+# 站点自己的样式表（第三方资源，本地测试用，不进仓库）
+test/assets/
+
+# Python 编译缓存
+__pycache__/

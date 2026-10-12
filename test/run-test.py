@@ -268,14 +268,18 @@ CHECK_JS = r"""
       barsText: txt('[data-fw-bar]').slice(0, 700),
       crumbBadge: n('a[href$="/threads/__TID__/profile"] [data-fw-badge]'),
       bookItemBadge: n('article[class*="item"][class*="id__TID__"] [data-fw-badge]'),
-      markBtns: n('[data-fw-mark]'),
-      bmkBtns: n('[data-fw-bmk]'),
+      // 章首那条标记条（章末还有一条一模一样的，另外数）
+      markBtns: n('[data-fw-bar] [data-fw-mark]'),
+      bmkBtns: n('[data-fw-bar] [data-fw-bmk]'),
+      endBars: n('[data-fw-end]'),
+      endMarkBtns: n('[data-fw-end] [data-fw-mark]'),
+      endBmkBtns: n('[data-fw-end] [data-fw-bmk]'),
       // 章节内只留书签了 —— 备注的入口必须一个都不剩
       noteBtns: n('[data-fw-note]'),
       // 书名后那个「▶ 读到某章」要能点着跳回去
       jumpPills: n('[data-fw-jump]'),
       // 书签钮只留一个图标：标了的是亮的（带 data-fw-bmkon），没标的是灰的
-      bmkOn: n('[data-fw-bmk][data-fw-bmkon]'),
+      bmkOn: n('[data-fw-bar] [data-fw-bmk][data-fw-bmkon]'),
       bmkSeeded: liveBmks().length,
       // 同一章里还活着的书签（验跨设备去重）
       dupLive: liveBmks().filter(function (m) { return m.cid === '__PID_BMK__'; }).length,
@@ -301,8 +305,7 @@ CHECK_JS = r"""
       barProgPills: n('[data-fw-bar] [data-fw-progdel]'),
       barProgJumps: n('[data-fw-bar] [data-fw-jump]'),
       // 最后一章正文末尾那个「我读完了」
-      endBtns: n('[data-fw-end]'),
-      endText: txt('[data-fw-end]').slice(0, 120),
+      endText: txt('[data-fw-end]'),
       // 列表页：进度单独占一行、靠右；标签这些短的还是挂书名后
       listRows: n('[data-fw-rows]'),
       listRowsText: txt('[data-fw-rows]').slice(0, 400),
@@ -380,8 +383,9 @@ CHECK_JS = r"""
       var sr = h && h.shadowRoot;
       var sh = sr ? sr.querySelector('.sheet') : null;
       r.navOpens = !!(sh && sh.classList.contains('on'));
-      // 三个 subtab 都该存在
+      // 书评并进进度之后，只剩「进度」「书签」两个 tab
       r.tabCount = sr ? sr.querySelectorAll('.tabs [data-tab]').length : 0;
+      r.rateTabGone = sr ? !sr.querySelector('[data-tab="rate"]') : null;
       // 进度 tab：验「第几章/共几章」、有新章标记、以及读完的书被分出去
       var progTab = sr ? sr.querySelector('[data-tab="prog"]') : null;
       if (progTab) progTab.click();
@@ -389,14 +393,19 @@ CHECK_JS = r"""
       r.progSub = sr ? ((sr.querySelector('.sheet header .sub') || {}).textContent || '') : '';
       r.progOrder = sr ? [].map.call(sr.querySelectorAll('[data-list] .book'),
         function (e) { return e.getAttribute('data-bid'); }) : [];
-      // 排序验在「书评」tab：默认的「书签」tab 只有一本书有书签，看不出先后。
       // 取书 id 而不是书名 —— 书名会被页面上的真实标题覆盖（noteBook 会更新它）
-      var rate = sr ? sr.querySelector('[data-tab="rate"]') : null;
-      if (rate) rate.click();
-      r.allListOrder = sr
-        ? [].map.call(sr.querySelectorAll('.book'),
-            function (e) { return e.getAttribute('data-bid'); })
-        : [];
+      r.allListOrder = r.progOrder;
+      // 分组标题（读完了 / 没有进度 / 弃坑），点一下收起
+      r.grpTitles = sr ? [].map.call(sr.querySelectorAll('[data-fold]'),
+        function (e) { return e.getAttribute('data-fold'); }) : [];
+      var fd = sr ? sr.querySelector('[data-fold="finished"]') : null;
+      if (fd) fd.click();
+      r.foldHidesDone = sr ? !sr.querySelector('[data-list] .book[data-bid="__DONE__"]') : null;
+      r.foldSaved = !!(((db().cfg || {}).fold || {}).finished) ||
+        !!((window.__fw && window.__fw.DB.d.cfg.fold || {}).finished);
+      fd = sr ? sr.querySelector('[data-fold="finished"]') : null;
+      if (fd) fd.click();      // 展开回来，别影响后面的断言
+      r.unfoldShowsDone = sr ? !!sr.querySelector('[data-list] .book[data-bid="__DONE__"]') : null;
       // 写好的书评是纯文本，不是一直摆着的输入框；铅笔点开才有输入框
       r.rateRvText = sr ? ((sr.querySelector('.book .rv') || {}).textContent || '') : '';
       r.rateFirstTitle = sr ? ((sr.querySelector('.book .bt') || {}).textContent || '') : '';
@@ -413,11 +422,12 @@ CHECK_JS = r"""
     /* 模式一：点「上次读到」提示条。
      *
      * 麻烦在于点了就会跳转，文档一被换走，dump-dom 就什么都取不到。
-     * 办法：
-     *   1. 临时钩住 Storage.setItem，截下脚本存的「定位接力棒」
-     *   2. 把结果写进 localStorage
-     *   3. 同一个同步任务里再把 location.href 改指到 /__relay__ —— 后一次赋值
-     *      会盖掉脚本刚发起的那次跳转，于是落地在取结果页上，结果就带出来了
+     * 办法：临时钩住 Storage.setItem 截下脚本存的「定位接力棒」，
+     * 然后马上 window.stop() 把这次跳转掐掉，原地交结果。
+     *
+     * 以前是再赋一次 location.href 跳去取结果页、指望后一次跳转盖掉前一次 ——
+     * 那是在赌时序：页面一加载上真样式表，两次跳转都发出去了，Chrome 卡在中间
+     * 一个字都不吐（实测，查了好一阵）。掐掉跳转就没有这个赛跑了。
      */
     if (location.search.indexOf('fwtest=strip') >= 0) {
       var s = document.querySelector('[data-fw-strip]');
@@ -428,12 +438,10 @@ CHECK_JS = r"""
           return origSet.apply(this, arguments);
         };
         s.click();
+        window.stop();
         Storage.prototype.setItem = origSet;
         r.jumpPending = cap || '';
-        r.jsErrors = errs;
-        try { localStorage.setItem('__fw_relay__', JSON.stringify(r)); } catch (e) {}
-        location.href = '/__relay__';
-        return;
+        return finish();
       }
     }
 
@@ -461,6 +469,73 @@ CHECK_JS = r"""
       return;
     }
 
+    /* 黑夜模式：网页、面板一起暗；我们自己的彩色小条不能被洗成灰的；
+     * 面板头上的 🌙 能一键关掉，并且记住（下次开页面靠它抢在画出来之前套上） */
+    if (location.search.indexOf('fwtest=dark') >= 0) {
+      var hd = document.getElementById('__fw_marks__');
+      r.darkStyle = !!document.getElementById('__fw_dark__');
+      r.darkBodyBg = getComputedStyle(document.body).backgroundColor;
+      r.darkHost = !!(hd && hd.classList.contains('dark'));
+      r.darkFlag = localStorage.getItem('__fwm__dark');
+      var pillEl = document.querySelector('[data-fw-jump]');
+      r.darkPillBg = pillEl ? getComputedStyle(pillEl).backgroundColor : '';
+      r.darkSheetBg = hd && hd.shadowRoot
+        ? getComputedStyle(hd.shadowRoot.querySelector('.sheet')).backgroundColor : '';
+      // 带 &keep 是截图用：保持黑着，不去验关掉那一步（再带 &panel 就把面板也开着）
+      if (location.search.indexOf('keep') >= 0) {
+        if (location.search.indexOf('panel') >= 0) {
+          var nv2 = document.querySelector('[data-fw-nav] [data-fw-open]');
+          if (nv2) nv2.click();
+        }
+        return finish();
+      }
+      var moon = hd && hd.shadowRoot && hd.shadowRoot.querySelector('.moon');
+      if (moon) moon.click();
+      r.darkOffStyle = !!document.getElementById('__fw_dark__');
+      r.darkOffFlag = localStorage.getItem('__fwm__dark');
+      return finish();
+    }
+
+    // 截图用：把「我的标记」开着不关（--shot 时看面板长什么样）
+    if (location.search.indexOf('fwtest=openpanel') >= 0) {
+      var nv = document.querySelector('[data-fw-nav] [data-fw-open]');
+      if (nv) nv.click();
+      return finish();
+    }
+
+    /* 云端的进度只到「第几章」：章内位置只留本机。
+     * 直接调同步层（测试台上 window.__fw 挂着内部对象），不用真连云端。 */
+    if (location.search.indexOf('fwtest=cloudprog') >= 0) {
+      var F = window.__fw;
+      if (!F) { r.cloudHook = false; return finish(); }
+      r.cloudHook = true;
+      var body = JSON.parse(F.Sync.fileText('prog.json')).data['__TID__'] || {};
+      r.cloudKeys = Object.keys(body).sort().join(',');
+      // 同一章里滚动（只动章内位置）→ 云端那份一个字都不该变
+      var before = F.Sync.fileText('prog.json');
+      var lp = F.DB.d.prog['__TID__'];
+      lp.cpct = 0.91; lp.anchor = '换了一句'; lp.updatedAt = Date.now();
+      r.cloudSameAfterScroll = F.Sync.fileText('prog.json') === before;
+      // 云端是同一章、时间更新 → 本机的章内位置得留着
+      F.Sync.applyFile('prog.json', { v: 1, data: { '__TID__': {
+        bid: '__TID__', cid: lp.cid, title: '云端同一章', url: '', no: 1,
+        deleted: false, updatedAt: 9e12 } } });
+      r.keptCpctSameChap = F.DB.d.prog['__TID__'].cpct;
+      // 云端换了章 → 本机采纳，章内位置作废（从章首开始）
+      F.Sync.applyFile('prog.json', { v: 1, data: { '__TID__': {
+        bid: '__TID__', cid: '__PID_CLICK__', title: '云端新的一章', url: '', no: 3,
+        deleted: false, updatedAt: 9.5e12 } } });
+      var after = F.DB.d.prog['__TID__'];
+      r.newChapCid = after.cid;
+      r.newChapHasPos = typeof after.cpct === 'number';
+      // 云端比本机旧 → 不理它
+      F.Sync.applyFile('prog.json', { v: 1, data: { '__TID__': {
+        bid: '__TID__', cid: '__PID_BMK__', title: '旧的', url: '', no: 2,
+        deleted: false, updatedAt: 5 } } });
+      r.oldIgnored = F.DB.d.prog['__TID__'].cid === '__PID_CLICK__';
+      return finish();
+    }
+
     /* 模式五：在进度 tab 里点标签 —— 要立刻生效，不用刷新页面。 */
     if (location.search.indexOf('fwtest=tagclick') >= 0) {
       var h3 = document.getElementById('__fw_marks__');
@@ -475,16 +550,26 @@ CHECK_JS = r"""
       if (pen3) pen3.click();
       var chip = sr3 && sr3.querySelector('[data-btag="弃坑"][data-bk="__TID__"]');
       r.tagChip = !!chip;
+      var order = function () {
+        return sr3 ? [].map.call(sr3.querySelectorAll('[data-list] .book'),
+          function (e) { return e.getAttribute('data-bid'); }) : [];
+      };
+      var posBefore = order().indexOf('__TID__');
       if (chip) chip.click();
       setTimeout(function () {
         var c2 = sr3 && sr3.querySelector('[data-btag="弃坑"][data-bk="__TID__"]');
         r.tagChipOn = !!(c2 && c2.classList.contains('on'));
         r.tagInStore = (((db().books || {})['__TID__'] || {}).tags || []).indexOf('弃坑') >= 0;
-        var rt = sr3 && sr3.querySelector('[data-tab="rate"]');
-        if (rt) rt.click();
+        // 编辑框还开着 → 这本书原地不动，不着急挪去弃坑组
+        r.tagStayedPut = order().indexOf('__TID__') === posBefore;
+        r.tagEditorStillOpen = !!(sr3 && sr3.querySelector('[data-rv="__TID__"]'));
+        var done = sr3 && sr3.querySelector('[data-pendone="__TID__"]');
+        if (done) done.click();
+        var o2 = order();
+        // 写好了 → 才挪去弃坑组（排最后）
+        r.tagMovedAfterDone = o2[o2.length - 1] === '__TID__';
         r.tagRateListed = sr3 ? sr3.querySelectorAll('.book[data-bid="__TID__"]').length : 0;
-        // 打了弃坑之后，书评 tab 里只该有「弃坑」这一个标签 ——
-        // 不该再多一个 ✕ 弃坑 的状态标（同一件事说两遍）
+        // 卡片书名那行里「弃坑」只该出现一次（标签那一个），不再多一个状态标
         r.tagRateTitle = sr3 ? ((sr3.querySelector('.book[data-bid="__TID__"] .bt')
           || {}).textContent || '') : '';
         finish();
@@ -525,6 +610,14 @@ CHECK_JS = r"""
     /* 模式三：滚到别的一章，看进度有没有及时换过去并落盘。
      * 「读到一半关掉、进度没更新」就是这条路上出的问题：
      * 防抖挂太久 + GM 存储是异步的，关页面那一刻两头都还没落地 */
+    if (location.search.indexOf('fwtest=postrec') >= 0) {
+      var pr = (db().prog || {})['__TID__'] || {};
+      r.postRecCid = pr.cid || null;
+      r.postRecHasPos = typeof pr.cpct === 'number';
+      r.savedAt = db().savedAt || 0;
+      return finish();
+    }
+
     if (location.search.indexOf('fwtest=scroll') >= 0) {
       var bar = document.querySelector('[data-fw-bar="__PID_CLICK__"]');
       var blk = bar ? bar.closest('[id^="post"]') : null;
@@ -552,7 +645,9 @@ CHECK_JS = r"""
     setTimeout(function () {
       r.bmkAfterAdd = liveBmks().length;
       r.barAfterAdd = barOf('__PID_CLICK__');
-      r.bmkOnAfterAdd = n('[data-fw-bmk][data-fw-bmkon]');
+      r.bmkOnAfterAdd = n('[data-fw-bar] [data-fw-bmk][data-fw-bmkon]');
+      // 章末那条也得跟着亮 —— 两条是同一份数据
+      r.endBmkOnAfterAdd = n('[data-fw-end] [data-fw-bmk][data-fw-bmkon]');
       document.querySelector('[data-fw-bmk="__PID_CLICK__"]').click();
       setTimeout(function () {
         r.bmkAfterToggle = liveBmks().length;
@@ -571,7 +666,7 @@ CHECK_JS = r"""
 })();
 """.replace('__TID__', TID).replace('__BOGUS__', BOGUS_TID) \
    .replace('__PID_BMK__', PIDS[1]).replace('__PID_CLICK__', PID_CLICK) \
-   .replace('__UPD__', UPD_TID)
+   .replace('__UPD__', UPD_TID).replace('__DONE__', DONE_TID)
 
 
 # ?fwtest=landing 时预先塞进 sessionStorage 的「定位接力棒」，
@@ -605,6 +700,29 @@ def inject_html(html, query=''):
         data['books'][TID]['chapTotal'] = len(PIDS)
         data['books'][TID]['doneRead'] = False
 
+    elif 'fwtest=listprog' in query:
+        # 列表页上的书都带一条进度，看状态小条摆在哪
+        data = json.loads(json.dumps(SEED))
+        for _i, _tid in enumerate(LIST_TIDS.values()):
+            data['prog'][_tid] = {
+                'bid': _tid, 'cid': '1', 'title': '某一章 名字故意起得很长很长很长',
+                'url': '/posts/1', 'no': 3 + _i, 'pct': 0.5, 'cpct': 0.5,
+                'anchor': '', 'ts': 1, 'updatedAt': 100 + _i,
+            }
+            data['books'][_tid]['chapTotal'] = 112
+        # 文库页上那本（TID）也给个总章数，方便看「第几章/共几章」
+        data['books'][TID]['chapTotal'] = 76
+
+    elif 'fwtest=postrec' in query:
+        # 进度原本记在别的章上；打开单章页之后就该换成这一章
+        data = json.loads(json.dumps(SEED))
+        data['prog'][TID]['cid'] = PIDS[3]
+        data['prog'][TID]['title'] = '第四章'
+
+    elif 'fwtest=dark' in query:
+        data = json.loads(json.dumps(SEED))
+        data['cfg']['dark'] = True
+
     elif 'fwtest=tagclick' in query:
         # 书记录被软删过、但进度还活着（老数据里真实存在这种）。
         # 进度 tab 靠 prog 表列，所以看得见；而书评 tab 走 liveBooks()，就看不见 ——
@@ -615,11 +733,12 @@ def inject_html(html, query=''):
         data['books'][TID]['review'] = ''
 
     elif 'fwtest=cidsowned' in query:
-        # 已经从详情页学过章节列表了 → 目录列表页不许再去覆盖它
-        # （详情页是权威来源，列表页会漏掉「限阅」那种章节）
+        # 已经从详情页学过章节列表了（里面有一章是目录列表页不列的「限阅」章，
+        # 这里用一个假 id 代替）。目录列表页要把新章**合并**进来，
+        # 但不许把那个「只有详情页才有」的章弄丢
         data = json.loads(json.dumps(SEED))
-        data['books'][TID]['cids'] = PIDS[:3]
-        data['books'][TID]['chapTotal'] = 3
+        data['books'][TID]['cids'] = PIDS[:3] + ['9999999']
+        data['books'][TID]['chapTotal'] = 4
 
     elif 'fwtest=progcleared' in query:
         # 在「我的标记 → 进度」里点了「清除进度」之后，详情页不该还显示「上次读到」
@@ -658,6 +777,8 @@ def inject_html(html, query=''):
     inject = ''.join(parts)
     # 夹具里的绝对域名要改回本地，否则点链接会跑到真站上去
     html = re.sub(r'https?://www\.xn--pxtr7m5ny\.com', '', html)
+    # 站点样式表指到本地那份（test/assets/app.css，没有就是朴素排版，功能照跑）
+    html = re.sub(r'https://[a-z0-9]+\.cloudfront\.net/css/(app\.css)\?[^"]*', r'/__assets__/\1', html)
     return html.replace('</body>', inject + '</body>') if '</body>' in html else html + inject
 
 
@@ -710,16 +831,20 @@ class H(http.server.BaseHTTPRequestHandler):
         if path == '/__routes__':
             return self._send(routes_page(path, True))
 
-        # 取结果页：故意不注入脚本，只把上一页存下的断言结果吐到 DOM 里
-        if path == '/__relay__':
-            return self._send(
-                '<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>'
-                '<script>'
-                'var v=null;try{v=localStorage.getItem("__fw_relay__");'
-                'localStorage.removeItem("__fw_relay__")}catch(e){}'
-                'var d=document.createElement("div");d.id="FWTEST";'
-                'd.textContent=v||"{}";document.body.appendChild(d);'
-                '</script></body></html>')
+        # 站点自己的样式表（本地缓存一份）。有了它夹具才是真实排版 ——
+        # 不然 bootstrap 的栅格都不生效，「靠右」「同一行」这类断言根本没法验
+        if path.startswith('/__assets__/'):
+            f = os.path.join(HERE, 'assets', os.path.basename(path))
+            if os.path.exists(f):
+                with open(f, 'rb') as fh:
+                    return self._send(fh.read(), 'text/css; charset=utf-8')
+            return self._send('', 'text/css; charset=utf-8', 404)
+
+        # 样式表里引的字体（/fonts/vendor/...）本地没有，回干脆的 404。
+        # 不然会落到下面「没夹具的页面」那条路上，回一整页 HTML 外加注入的脚本 ——
+        # 浏览器拿它当字体解，还在要真跳页面的用例里把 Chrome 卡住（实测）
+        if path.startswith('/fonts/'):
+            return self._send('', 'text/plain', 404)
 
         fixture = route_for(path)
         if not fixture:
@@ -740,6 +865,35 @@ def serve():
 
 
 CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+
+def shot(url, out, width=390, height=1400):
+    """跑一次 headless Chrome 截图（iPhone 宽度）。
+    排版、颜色这类事断言写不全，得用眼睛看 —— python3 test/run-test.py --shot <路径> <out.png>"""
+    import shutil
+    import tempfile
+    import time
+    profile = tempfile.mkdtemp(prefix='fw-shot-profile-')
+    if os.path.exists(out):
+        os.unlink(out)        # 不删的话下面一看「文件已存在」就收工了，拿到的是上一张
+    with open(os.devnull, 'w') as fe:
+        p = subprocess.Popen(
+            [CHROME, '--headless=old', '--disable-gpu', '--no-sandbox', '--hide-scrollbars',
+             '--no-first-run', '--no-default-browser-check', '--disable-extensions',
+             '--disable-component-update', '--user-data-dir=' + profile,
+             f'--window-size={width},{height}', '--force-device-scale-factor=2',
+             '--virtual-time-budget=6000', '--screenshot=' + out, url],
+            stdout=fe, stderr=fe)
+        for _ in range(60):
+            time.sleep(0.5)
+            if os.path.exists(out) and os.path.getsize(out) > 0 and p.poll() is not None:
+                break
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                time.sleep(1)
+                break
+        p.kill()
+    shutil.rmtree(profile, ignore_errors=True)
+    return os.path.exists(out)
 
 
 def dump(url):
@@ -871,6 +1025,14 @@ def main():
         except KeyboardInterrupt:
             return
 
+    if '--shot' in sys.argv:
+        i = sys.argv.index('--shot')
+        path, out = sys.argv[i + 1], sys.argv[i + 2]
+        w = int(sys.argv[i + 3]) if len(sys.argv) > i + 3 and sys.argv[i + 3].isdigit() else 390
+        ok = shot(f'http://127.0.0.1:{PORT}{path}', out, width=w)
+        print('截图', '好了：' + out if ok else '失败')
+        return 0 if ok else 1
+
     if not os.path.exists(CHROME):
         print('× 没找到 Chrome。可以改用 python3 test/run-test.py --serve 手动在浏览器里看')
         return 1
@@ -891,7 +1053,8 @@ def main():
             ('目录上方有 3 个操作按钮', lambda r: r['pageActions'] == 3),
             ('顶栏那一项写着「我的标记」', lambda r: '我的标记' in r['navText']),
             ('点顶栏入口能打开面板',   lambda r: r['navOpens'] is True),
-            ('我的标记有三个 subtab',  lambda r: r.get('tabCount') == 3),
+            ('只剩进度、书签两个 tab', lambda r: r.get('tabCount') == 2
+             and r.get('rateTabGone') is True),
             ('进度显示「当前章/总章数」',
              lambda r: re.search(r'\d+/\d+', r.get('progText', '')) is not None),
             ('有新章会标出来',         lambda r: '有新章' in r.get('progText', '')),
@@ -919,18 +1082,22 @@ def main():
              lambda r: '已读完' in r.get('progText', '')
              and '标已读完' not in r.get('progText', '')),
             ('最近读的书排在列表最前', lambda r: (r.get('allListOrder') or [None])[0] == TID),
-            ('书评 tab 列出了多本书（排序才有意义）',
+            ('进度 tab 列出了多本书（排序才有意义）',
              lambda r: len(r.get('allListOrder') or []) >= 2),
-            # 只有进度、没打标签也没写书评的书，不该挤进书评 tab
-            ('没评过的书不出现在书评 tab',
-             lambda r: UPD_TID not in (r.get('allListOrder') or [])),
+            # 书评并进来之后，没进度但打过标签的书也得在这儿（「没有进度」那组）
+            ('没进度但评过的书也列出来了',
+             lambda r: LIST_TIDS['home'] in (r.get('allListOrder') or [])),
+            ('读完 / 没有进度 / 弃坑 三组有分组标题',
+             lambda r: set(r.get('grpTitles') or []) >= {'finished', 'none', 'dropped'}),
+            ('点分组标题能收起来，并记住', lambda r: r.get('foldHidesDone') is True
+             and r.get('foldSaved') is True),
+            ('再点一下展开回来',       lambda r: r.get('unfoldShowsDone') is True),
             ('写好的书评显示成文本',   lambda r: '总评测试' in r.get('rateRvText', '')),
             ('没点铅笔时不摆输入框',   lambda r: r.get('rateTextareas') == 0),
             ('每本书名后都有铅笔',     lambda r: (r.get('ratePens') or 0) >= 1),
             # 书评 tab 的书名后也标一下进度
-            ('书评 tab 书名后标了进度',
-             lambda r: re.search(r'\d+/\d+|读完|在读|弃坑',
-                                 r.get('rateFirstTitle', '')) is not None),
+            ('书名后标了进度',
+             lambda r: re.search(r'\d+/\d+|读完', r.get('rateFirstTitle', '')) is not None),
             ('点铅笔就展开书评框 + 标签',
              lambda r: r.get('penBoxes') == 1 and (r.get('penTags') or 0) >= 1),
             ('书名后的进度条能点着跳', lambda r: (r.get('jumpPills') or 0) >= 1),
@@ -938,9 +1105,9 @@ def main():
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}/chapter_index?fwtest=cidsowned',
-         '详情页学过之后 → 目录列表页不许覆盖', [
-            ('章节数还是详情页那份', lambda r: r.get('learnedTotal') == 3
-             and len(r.get('learnedCids') or []) == 3),
+         '详情页学过之后 → 目录列表页把新章合并进来', [
+            ('新章都合并进来了',     lambda r: r.get('learnedTotal') == CHAP_TOTAL + 1),
+            ('详情页才有的那章还在', lambda r: '9999999' in (r.get('learnedCids') or [])),
             ('没有 JS 报错',        lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}/profile?fwtest=cidsowned',
@@ -986,6 +1153,9 @@ def main():
             (f'{len(PIDS)} 章都挂上了标记条', lambda r: r['bars'] == len(PIDS)),
             ('标记条上有三个标签钮',   lambda r: r['markBtns'] == len(PIDS) * 3),
             (f'每章都有书签钮',        lambda r: r['bmkBtns'] == len(PIDS)),
+            # 章末也有一条一样的标记条，读完一章不用滚回章首
+            ('每章末尾也有一条标记条', lambda r: r['endBars'] == len(PIDS)
+             and r['endMarkBtns'] == len(PIDS) * 3 and r['endBmkBtns'] == len(PIDS)),
             ('已标章节高亮正确',       lambda r: '精彩' in r['barsText'] and '跳过' in r['barsText']),
             # 「读到哪一章」由面包屑上那个进度小条说明，标记条上不再写红字
             ('标记条上没有「读到这里」红字', lambda r: '读到这里' not in r['barsText']),
@@ -1003,6 +1173,7 @@ def main():
              and '备注' not in r['barsText']),
             ('点 🔖 真能加上书签',     lambda r: r['clickTested'] and r['bmkAfterAdd'] == r['bmkSeeded'] + 1),
             ('加完那一章的图标立刻亮起来', lambda r: r.get('bmkOnAfterAdd') == 3),
+            ('章末那条也跟着亮',       lambda r: r.get('endBmkOnAfterAdd') == 3),
             ('同位置再点 = 取消',      lambda r: r['bmkAfterToggle'] == r['bmkSeeded']),
             # 「回去吗」确认栏横在底部时，不许把下面网站自己的链接挡死
             ('确认栏没挡住页面链接',   lambda r: not r['blockedLinks']),
@@ -1012,6 +1183,7 @@ def main():
             ('顶栏入口在、悬浮球没了', lambda r: r['navEntry'] == 1 and r['fabLeft'] == 0),
             ('只认出 1 章（回帖没被算进来）', lambda r: r['bars'] == 1),
             ('标记条挂上了',           lambda r: r['markBtns'] == 3 and r['bmkBtns'] == 1),
+            ('章末也挂了一条',         lambda r: r['endBars'] == 1),
             ('本章标签识别正确',       lambda r: '精彩' in r['barsText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
@@ -1024,10 +1196,16 @@ def main():
              lambda r: '"cpct"' in (r.get('jumpPending') or '')),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
-        (f'/threads/{TID}?fwtest=scroll', '读到一半 → 进度要及时换章并落盘', [
+        # 论坛模式（/threads/{id}，一页多章夹着回帖）多半是在翻评论 ——
+        # 在那儿滚两下不许把进度挪走
+        (f'/threads/{TID}?fwtest=scroll', '论坛模式里滚动 → 不许挪进度', [
             ('确实滚过去了',           lambda r: r.get('scrollTested') is True),
-            ('进度换成了滚到的那一章', lambda r: r.get('progAfterScroll') == PID_CLICK),
-            ('进度里带着章内位置',     lambda r: r.get('progHasPos') is True),
+            ('进度还是原来那一章',     lambda r: r.get('progAfterScroll') == PID_PROGRESS),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/posts/{PID_PROGRESS}?fwtest=postrec', '单章页 → 进度要记下来并落盘', [
+            ('进度换成了这一章',       lambda r: r.get('postRecCid') == PID_PROGRESS),
+            ('进度里带着章内位置',     lambda r: r.get('postRecHasPos') is True),
             ('存储盖了 savedAt 时间戳（关页面兜底靠它选新的那份）',
              lambda r: (r.get('savedAt') or 0) > 0),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
@@ -1041,14 +1219,17 @@ def main():
             ('记下了这次查过的时间', lambda r: (r.get('updCheckedAt') or 0) > 1),
             ('没有 JS 报错',        lambda r: not r['jsErrors']),
         ]),
-        (f'/threads/{TID}?fwtest=tagclick', '进度 tab 里打标签 → 立刻生效', [
+        (f'/threads/{TID}?fwtest=tagclick', '进度 tab 里打弃坑 → 写好了才挪组', [
             ('进度 tab 列出了这本',   lambda r: r.get('tagProgListed') == 1),
             ('书名后有铅笔',          lambda r: r.get('tagPen') is True),
             ('编辑块里有标签格子',    lambda r: r.get('tagChip') is True),
             ('点完标签真写进存储了',  lambda r: r.get('tagInStore') is True),
             ('格子立刻变成选中态',    lambda r: r.get('tagChipOn') is True),
-            ('书评 tab 立刻也列出来了', lambda r: r.get('tagRateListed') == 1),
-            ('书评 tab 里弃坑只出现一次',
+            # 编辑框开着时点了「弃坑」，卡片原地不动；点「写好了」才挪到弃坑组
+            ('编辑框开着时原地不动',  lambda r: r.get('tagStayedPut') is True
+             and r.get('tagEditorStillOpen') is True),
+            ('写好了之后才挪去弃坑组', lambda r: r.get('tagMovedAfterDone') is True),
+            ('书名那行弃坑只出现一次',
              lambda r: r.get('tagRateTitle', '').count('弃坑') == 1
              and '✕' not in r.get('tagRateTitle', '')),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
@@ -1058,15 +1239,38 @@ def main():
             ('进度 tab 列出了这本',   lambda r: r.get('tagProgListed') == 1),
             ('点完标签真写进存储了',  lambda r: r.get('tagInStore') is True),
             ('格子立刻变成选中态',    lambda r: r.get('tagChipOn') is True),
-            ('书评 tab 立刻也列出来了', lambda r: r.get('tagRateListed') == 1),
+            ('写好了之后标签显示出来了', lambda r: r.get('tagRateListed') == 1
+             and '弃坑' in r.get('tagRateTitle', '')),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}?fwtest=lastchap', '最后一章 → 正文末尾也有「我读完了」', [
-            ('标记条上有一个',       lambda r: '我读完了' in r['barsText']),
-            ('正文末尾也有一个',     lambda r: r.get('endBtns') == 1
-             and '我读完了' in r.get('endText', '')),
-            ('只有最后那一章有',     lambda r: r['barsText'].count('我读完了') == 1),
+            # 读完那一刻人就在末尾，章首那条不用再放
+            ('章首那条里没有',       lambda r: '我读完了' not in r['barsText']),
+            ('只有最后那一章末尾有', lambda r: r.get('endText', '').count('我读完了') == 1),
             ('没有 JS 报错',        lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=cloudprog', '云端进度只到「第几章」', [
+            ('测试挂钩在',             lambda r: r.get('cloudHook') is True),
+            ('云端那份不带章内位置',
+             lambda r: not any(k in r.get('cloudKeys', '').split(',')
+                               for k in ('cpct', 'pct', 'anchor'))),
+            ('同一章里滚动，云端那份不变（不推）', lambda r: r.get('cloudSameAfterScroll') is True),
+            ('云端同一章更新 → 本机章内位置留着', lambda r: r.get('keptCpctSameChap') == 0.91),
+            ('云端换了章 → 采纳，从章首开始',
+             lambda r: r.get('newChapCid') == PID_CLICK and r.get('newChapHasPos') is False),
+            ('云端比本机旧 → 不理',    lambda r: r.get('oldIgnored') is True),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=dark', '黑夜模式', [
+            ('网页套上了深色样式',     lambda r: r.get('darkStyle') is True
+             and r.get('darkBodyBg') == 'rgb(20, 20, 22)'),
+            ('面板也暗了',             lambda r: r.get('darkHost') is True
+             and r.get('darkSheetBg') == 'rgb(28, 28, 31)'),
+            ('我们的彩色小条没被洗灰', lambda r: r.get('darkPillBg') == 'rgb(232, 85, 78)'),
+            ('记下了，下次开页面能抢先套上', lambda r: r.get('darkFlag') == '1'),
+            ('点 🌙 一键关掉',         lambda r: r.get('darkOffStyle') is False
+             and r.get('darkOffFlag') == '0'),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}?fwtest=crosstab', '两个标签页同时写 → 不许互相冲掉', [
             ('确实触发了本页的写入', lambda r: r.get('crossTriggered') is True),
@@ -1162,6 +1366,9 @@ def main():
     for path, label, checks in cases:
         print(f'\n=== {label}  ({path}) ===')
         r, raw = dump(f'http://127.0.0.1:{PORT}{path}')
+        if r is None:
+            # Chrome 偶尔一个字都不吐，重跑一次，还不行才算真挂
+            r, raw = dump(f'http://127.0.0.1:{PORT}{path}')
         if r is None:
             print('  × 页面没跑出结果，可能脚本抛异常了。原始输出尾部：')
             print('   ', raw[-400:].replace('\n', ' '))
