@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.15.0
+// @version      1.16.0
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -483,6 +483,19 @@
       return p.no >= b.chapTotal;
     },
 
+    /*
+     * 「接下来看」：排着队、还没开始读（或者先放一放）的书。记在书记录上，跟着同步。
+     * queuedAt 用来排先后 —— 先排进来的先看。真开始读了（记进度时）会自动出队。
+     */
+    setQueued(bid, on) {
+      const b = this.editBook(bid);
+      if (!b) return null;
+      b.queued = !!on;
+      b.queuedAt = on ? now() : null;
+      this.touch(b);
+      return b;
+    },
+
     // 手动标「已读完 / 还没读完」。进度一个字都不动
     setDoneRead(bid, on) {
       const b = this.editBook(bid);
@@ -632,6 +645,8 @@
   };
   await DB.load();
   const migrated = DB.migrate();   // 清掉 v1.0 猜错 URL 规律留下的假记录
+  // 每次都补一遍 chapAt（很便宜）：别的标签页、老版本设备写进来的进度也可能缺它
+  DB.ensureChapAt();
 
   // ==========================================================================
   // 3. 云同步（GitHub 私有仓库 + 坚果云）—— 逐条时间戳合并，不是整包覆盖
@@ -1395,6 +1410,8 @@
       // 书记录被软删过的话要救回来 —— 不然详情页显示着「上次读到」，
       // 「我的标记」里却一本都不列（出过这个问题）
       if (b.deleted) { b.deleted = false; dirty = true; }
+      // 排在「接下来看」里的书，一读就算开始了，挪回在读
+      if (b.queued) { b.queued = false; b.queuedAt = null; dirty = true; }
       if (dirty) DB.touch(b);
     },
     // 回到上次位置：优先用锚文本，找不到再退回百分比
@@ -1581,9 +1598,15 @@
     display: flex; align-items: center; gap: 8px;
     padding: 13px 14px; border-bottom: 1px solid #ececec; flex: none;
   }
-  .sheet header h3 { margin: 0; font-size: 15px; flex: 1; font-weight: 600;
+  .sheet header h3 { margin: 0; font-size: 15px; flex: 0 1 auto; min-width: 0; font-weight: 600;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .sheet header .sub { font-size: 11px; color: #8e8e93; font-weight: 400; }
+  /* 标题后面那个 ⚙️：只在「我的标记」里出现，紧挨着标题 */
+  .sheet header .gear { flex: none; cursor: pointer; font-size: 15px; opacity: .8;
+    padding: 2px 4px; display: none; }
+  .sheet header .gear.on { display: inline; }
+  .sheet header .sub { font-size: 11px; color: #8e8e93; font-weight: 400;
+    flex: 1; text-align: right; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .body { overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 14px; flex: 1; }
 
   .row { margin-bottom: 16px; }
@@ -1734,7 +1757,7 @@
 
 <div class="mask"></div>
 <div class="sheet">
-  <header><h3></h3><span class="sub"></span>
+  <header><h3></h3><span class="gear" title="设置">⚙️</span><span class="sub"></span>
     <button class="btn g sm moon" title="黑夜模式">🌙</button>
     <button class="btn g sm cls">关闭</button></header>
   <div class="body"></div>
@@ -1771,12 +1794,19 @@
   function openSheet(v) { view = v || 'ctx'; render(); mask.classList.add('on'); sheet.classList.add('on'); }
   function closeSheet() {
     mask.classList.remove('on'); sheet.classList.remove('on');
-    editing = null; frozen = null;    // 下次打开不要还挂着上次那个展开的编辑框
+    closeEditor();    // 下次打开不要还挂着上次那个展开的编辑框
   }
   // 页面上各处入口统一走这里
   function openView(v) { openSheet(v === 'book' ? 'ctx' : v); }
   mask.onclick = closeSheet;
   $('.cls').onclick = closeSheet;
+  // 标题「我的标记」后面那个 ⚙️：直接进设置
+  $('.gear').onclick = () => {
+    closeEditor();
+    view = 'cfg';
+    render();
+    sBody.scrollTop = 0;
+  };
   // 面板头上那个 🌙：随手切黑夜 / 白天，不用钻进设置
   $('.moon').onclick = () => {
     setDark(!DB.d.cfg.dark);
@@ -1808,6 +1838,7 @@
   // 认得出书就渲染「这本书」。章节那点事（标记 / 书签）全在正文里内联做完了，
   // 不需要单独的章节面板
   function render() {
+    $('.gear').classList.toggle('on', view === 'all' || (view !== 'cfg' && !Page.bid));
     if (view === 'all') return renderAll();
     if (view === 'cfg') return renderCfg();
     if (view === 'tags') return renderTags();
@@ -1890,6 +1921,10 @@
         <label>阅读进度（自动记的，会被覆盖）</label>
         <button class="btn" data-act="continue">▶ 继续读：${esc(pg.title || '上次的位置')} · ${Math.round((pg.cpct || pg.pct || 0) * 100)}%</button>
       </div>` : ''}
+      <div class="btns" style="margin:-6px 0 14px">
+        <button class="btn g sm" data-queue="${esc(b.id)}" data-on="${b.queued ? '1' : ''}">
+          ${b.queued ? '📌 已在接下来看 · 点一下移出' : '📌 接下来看'}</button>
+      </div>
       <div class="row">
         <label>书签（手动加的，不会被覆盖）${bmks.length ? ' · ' + bmks.length + ' 个' : ''}</label>
         ${bmkListHTML(bmks, '这本书还没有书签喵。读正文时点章节下面那个 🔖 就能加。')}
@@ -1928,11 +1963,10 @@
   // 存成状态而不是直接 toggle class：点标签会重绘列表，重绘完得还开着
   let editing = null;
   /*
-   * 编辑框开着的那本书，**分组和排序都定格在打开那一刻** ——
-   * 不然在编辑框里点了「弃坑」，卡片当场就跳到最底下的弃坑组去了，
-   * 人还没写完。点「写好了」（或者收起编辑框）才重新归类。
+   * 编辑框里改的是一份**草稿**，点「写好了」才写进去 —— 没点就关掉，这次改的都不算。
+   * 所以在编辑框里点了「弃坑」，卡片也不会当场跑去弃坑组：数据压根还没变。
    */
-  let frozen = null;     // { bid, group, key }
+  let draft = null;      // { bid, tags: [...], review: '' }
 
   function renderAll(kw) {
     if (kw !== undefined) searchKw = kw;
@@ -1975,16 +2009,16 @@
     `<span class="pen" data-pen="${esc(bid)}" title="写书评 / 打标签">✏️</span>`;
 
   function rvBoxHTML(b) {
-    if (editing !== b.id) return '';
+    if (editing !== b.id || !draft) return '';
     return `<div class="rvbox">
       <div class="tags">
-        ${DB.d.tagPool.map((t) => `<span class="t ${b.tags.includes(t) ? 'on' : ''}"
+        ${DB.d.tagPool.map((t) => `<span class="t ${draft.tags.includes(t) ? 'on' : ''}"
           data-btag="${esc(t)}" data-bk="${esc(b.id)}">${esc(t)}</span>`).join('')}
         <span class="t add" data-newtag="${esc(b.id)}">＋ 新标签</span>
         <span class="t add" data-tagmgr>✎ 管理</span>
       </div>
       <textarea class="rvedit" data-rv="${esc(b.id)}"
-        placeholder="这本书读下来感觉如何…（边写边存）">${esc(b.review)}</textarea>
+        placeholder="这本书读下来感觉如何…（点「写好了」才保存）">${esc(draft.review)}</textarea>
       <div class="btns" style="margin-top:6px">
         <button class="btn sm" data-pendone="${esc(b.id)}">写好了</button>
         <button class="btn g sm" data-ratedel="${esc(b.id)}">清空书评、标签和章节标记</button>
@@ -2024,32 +2058,24 @@
 
   // ---- tab：进度（连同书评、标签、章节标记）----
   /*
-   * 列的是**进度记录 + 评过的书**的并集：有进度的按进度归组，
-   * 没进度但打过标签 / 写过书评 / 标过章节的也得有地方放（书评 tab 并进来之前它们在那儿）。
    * 从 prog 表出发而不是从书出发 —— 书记录可能还没建或被软删过，
    * 那样的进度照样得列出来（出过「详情页有进度、我的标记里没有」的事）。
+   * 没进度的书只有两种会列出来：排进了「接下来看」的、打了「弃坑」的。
    *
-   * 分组：在读 → 读完了 → 没进度 → 弃坑。后三组能收起来（记在本机设置里）。
+   * 分组：在读 → 接下来看 → 读完了 → 弃坑，每组都能收起来（记在本机设置里）。
    * 在读按「最近读」排（进度自己的 updatedAt），不用 lastActive ——
    * 后者会被「查了一次新章」这类跟阅读无关的改动顶上去。
+   * 接下来看按排进来的先后（先排的先看）。
    */
   const GROUPS = [
-    ['reading', '在读'], ['finished', '读完了'], ['none', '没有进度'], ['dropped', DROP_TAG],
+    ['reading', '在读'], ['next', '接下来看'], ['finished', '读完了'], ['dropped', DROP_TAG],
   ];
 
   function groupOf(b, p) {
     if (DB.isDropped(b.id)) return 'dropped';   // 弃坑优先：坑都弃了，读到哪无所谓
-    if (!p) return 'none';
-    return DB.isFinished(b.id) ? 'finished' : 'reading';
-  }
-
-  // 打开编辑框那一刻，记下这本书当时在哪一组、按什么排 —— 关掉之前都按它摆
-  function freezeFor(bid) {
-    frozen = null;
-    if (!bid) return;
-    const b = DB.book(bid, false) || { id: bid, tags: [], updatedAt: 0 };
-    const p = DB.prog(bid);
-    frozen = { bid, group: groupOf(b, p), key: p ? (p.updatedAt || 0) : (b.updatedAt || 0) };
+    if (DB.isFinished(b.id)) return 'finished';
+    if (b.queued) return 'next';
+    return p ? 'reading' : null;                // 没进度、也没排队的不列
   }
 
   function paintProgTab(box, kw) {
@@ -2058,14 +2084,15 @@
     const add = (b, p) => {
       if (seen.has(b.id)) return;
       seen.add(b.id);
+      const group = groupOf(b, p);
+      if (!group) return;
       const cs = DB.chapsOf(b.id).filter((c) => c.mark || c.note);
       const hit = !kw || [b.title, p && p.title, b.review, ...(b.tags || []),
         ...cs.map((c) => (c.title || '') + (c.note || ''))]
         .some((x) => (x || '').toLowerCase().includes(kw));
       if (!hit) return;
-      let group = groupOf(b, p);
-      let key = p ? (p.updatedAt || 0) : (b.updatedAt || 0);
-      if (frozen && frozen.bid === b.id) { group = frozen.group; key = frozen.key; }
+      const key = group === 'next' ? -(b.queuedAt || 0)
+        : p ? (p.updatedAt || 0) : (b.updatedAt || 0);
       items.push({ b, p, cs, group, key });
     };
     for (const p of Object.values(DB.d.prog)) {
@@ -2073,15 +2100,13 @@
       add(DB.book(p.bid, false) || { id: p.bid, title: '', tags: [], review: '' }, p);
     }
     for (const b of DB.liveBooks()) {
-      const rated = (b.tags || []).length || b.review ||
-        DB.chapsOf(b.id).some((c) => c.mark || c.note);
-      if (rated || editing === b.id) add(b, null);
+      if (b.queued || b.doneRead || DB.isDropped(b.id)) add(b, null);
     }
     items.sort((x, y) => y.key - x.key);
 
     const fold = DB.d.cfg.fold || {};
     const count = (g) => items.filter((x) => x.group === g).length;
-    const short = { reading: '在读', finished: '读完', none: '没进度', dropped: DROP_TAG };
+    const short = { reading: '在读', next: '待看', finished: '读完', dropped: DROP_TAG };
     sSub.textContent = GROUPS.map(([g]) => (count(g) ? `${count(g)} 本${short[g]}` : ''))
       .filter(Boolean).join(' · ');
 
@@ -2090,20 +2115,18 @@
       parts.push(`<div class="btns" style="margin-bottom:6px">
         <button class="btn g sm" data-act="chkupd">🔄 查一下有没有新章</button>
       </div>
-      <div class="hint" style="margin:0 0 12px">
+      <div class="hint" style="margin:0 0 4px">
         章节数是脚本<b>自己去数目录</b>得出的（站内那个「有更新」标记不太准）。<br>
-        只查<b>在读</b>的书 —— 标了完结的、标过「已读完」的、打了「${DROP_TAG}」的都不查。
+        只查<b>在读</b>的书 —— 接下来看的、读完的、弃坑的都不查。
       </div>`);
     }
     for (const [g, label] of GROUPS) {
       const list = items.filter((x) => x.group === g);
       if (!list.length) continue;
-      if (g !== 'reading') {
-        // 收起来的组只留一行标题，点一下再展开
-        parts.push(`<div class="grp" data-fold="${g}">${fold[g] ? '▸' : '▾'} ${esc(label)}
-          <span class="n">${list.length}</span></div>`);
-        if (fold[g]) continue;
-      }
+      // 收起来的组只留一行标题，点一下再展开
+      parts.push(`<div class="grp" data-fold="${g}">${fold[g] ? '▸' : '▾'} ${esc(label)}
+        <span class="n">${list.length}</span></div>`);
+      if (fold[g]) continue;
       parts.push(...list.map((x) => progCardHTML(x)));
     }
     box.innerHTML = parts.length ? parts.join('')
@@ -2143,6 +2166,8 @@
         ${p ? `<button class="btn g sm" data-doneread="${esc(b.id)}"
           data-on="${b.doneRead ? '1' : ''}">${b.doneRead ? '没读完' : '已读完'}</button>` : ''}
         ${p ? `<button class="btn g sm" data-progdel="${esc(b.id)}">清除进度</button>` : ''}
+        ${group === 'reading' || group === 'next' ? `<button class="btn g sm" data-queue="${esc(b.id)}"
+          data-on="${b.queued ? '1' : ''}">${b.queued ? '取消接下来看' : '📌 接下来看'}</button>` : ''}
         ${cs.length ? `<button class="btn g sm" data-toggle>标记章节 ${cs.length}</button>` : ''}
       </div>
       ${cs.length ? `<div class="chaplist">
@@ -2357,7 +2382,8 @@
     const t = e.target.closest('[data-act],[data-go],[data-tag],[data-jump],[data-ratedel],' +
       '[data-toggle],[data-bmkgo],[data-bmkdel],[data-bmktoggle],[data-tab],' +
       '[data-progdel],[data-backon],[data-pen],[data-pendone],[data-btag],[data-newtag],' +
-      '[data-doneread],[data-tagmgr],[data-tagren],[data-tagdel],[data-fold],[data-dark]');
+      '[data-doneread],[data-tagmgr],[data-tagren],[data-tagdel],[data-fold],[data-dark],' +
+      '[data-queue]');
     if (!t) return;
 
     // 某个云端的总开关：关掉就不参与同步，设置里也折叠起来不占地方
@@ -2379,51 +2405,45 @@
 
     // ---- 「我的标记」的三个 subtab ----
     if (t.dataset.tab) {
-      flushRvBox();
+      closeEditor();
       allTab = t.dataset.tab;
-      editing = null; frozen = null;
       render();
       sBody.scrollTop = 0;
       return;
     }
 
-    // 只重绘列表、不动整个面板，否则搜索框被换掉、iOS 键盘会闪。
-    // 重绘前必须先 flushRvBox()：正在编辑的文字只在 DOM 里，一换就没了
+    // 只重绘列表、不动整个面板，否则搜索框被换掉、iOS 键盘会闪
     if (t.dataset.pen) {
-      flushRvBox();
-      editing = editing === t.dataset.pen ? null : t.dataset.pen;
-      freezeFor(editing);
+      const same = editing === t.dataset.pen;
+      closeEditor();                       // 再点一次同一支铅笔 = 不写了，草稿作废
+      if (!same) openEditor(t.dataset.pen);
       paintList();
       return;
     }
     if (t.dataset.pendone) {
-      flushRvBox();
-      editing = null; frozen = null;
-      frozen = null;      // 写好了才重新归组：这时候点过的「弃坑」才挪过去
+      commitDraft();                       // 只有这一下才真的写进去
       paintList(); paintAll();
       toast('记下了喵 ✓');
       return;
     }
-    // 编辑块里的标签（指定哪本书，和「这本书」面板那套 data-tag 不同）
+    // 编辑框里的标签：只改草稿
     if (t.dataset.btag) {
-      flushRvBox();
-      const b = DB.editBook(t.dataset.bk);
-      if (!b) return;
+      if (!draft || draft.bid !== t.dataset.bk) return;
+      syncDraft();
       const tag = t.dataset.btag;
-      b.tags = b.tags.includes(tag) ? b.tags.filter((x) => x !== tag) : [...b.tags, tag];
-      DB.touch(b);
-      paintList(); paintAll();
+      draft.tags = draft.tags.includes(tag)
+        ? draft.tags.filter((x) => x !== tag) : [...draft.tags, tag];
+      paintList();
       return;
     }
     if (t.dataset.newtag) {
-      flushRvBox();
-      const b = DB.editBook(t.dataset.newtag);
+      if (!draft || draft.bid !== t.dataset.newtag) return;
+      syncDraft();
       const v = prompt('新标签（比如：甜文 / 追更中 / 弃坑）');
-      if (b && v && v.trim()) {
-        DB.addTag(v.trim());
-        if (!b.tags.includes(v.trim())) b.tags.push(v.trim());
-        DB.touch(b);
-        paintList(); paintAll();
+      if (v && v.trim()) {
+        DB.addTag(v.trim());               // 标签池只是个候选列表，直接加
+        if (!draft.tags.includes(v.trim())) draft.tags.push(v.trim());
+        paintList();
       }
       return;
     }
@@ -2436,8 +2456,9 @@
       return;
     }
 
+    // 去「管理标签」改个错别字再回来，编辑框里的草稿得还在
     if (t.hasAttribute('data-tagmgr')) {
-      flushRvBox();
+      syncDraft();
       view = 'tags'; render(); sBody.scrollTop = 0;
       return;
     }
@@ -2446,6 +2467,7 @@
       const to = prompt('改成什么？', from);
       if (to !== null && to.trim() && to.trim() !== from) {
         const n = DB.renameTag(from, to.trim());
+        if (draft) draft.tags = [...new Set(draft.tags.map((x) => (x === from ? to.trim() : x)))];
         toast(`改好了，顺手改了 ${n} 本书上的 ✓`);
         render(); paintAll();
       }
@@ -2455,15 +2477,27 @@
       const tag = t.dataset.tagdel;
       confirmBar(`删掉标签「${tag}」？所有书上这个标签也一起去掉`, () => {
         const n = DB.renameTag(tag, '');
+        if (draft) draft.tags = draft.tags.filter((x) => x !== tag);
         toast(`删了，顺手清了 ${n} 本书上的`);
         render(); paintAll();
       });
       return;
     }
 
+    // 排进 / 移出「接下来看」
+    if (t.dataset.queue) {
+      const on = !t.dataset.on;
+      if (t.dataset.queue === Page.bid) {
+        Page.noteBook(Page.bid, Page.bookTitle, FW.catalogUrl(Page.bid), true);
+      }
+      DB.setQueued(t.dataset.queue, on);
+      toast(on ? '排进「接下来看」了 📌' : '移出「接下来看」了');
+      render(); paintAll();
+      return;
+    }
+
     // 手动标「已读完 / 还没读完」。进度一点都不动，只是换个归类
     if (t.dataset.doneread) {
-      frozen = null;      // 编辑框外面的明确操作，立刻挪组
       const on = !t.dataset.on;
       DB.setDoneRead(t.dataset.doneread, on);
       toast(on ? '标成已读完了喵 ✓' : '挪回在读了');
@@ -2473,7 +2507,6 @@
 
     // 单独清掉某本书的阅读进度（书和标记都留着）
     if (t.dataset.progdel) {
-      frozen = null;
       const pg = DB.prog(t.dataset.progdel);
       if (pg) DB.clearProg(t.dataset.progdel);
       toast('已清除这本的进度');
@@ -2502,8 +2535,8 @@
     }
 
     if (t.dataset.go) {
-      flushRvBox();
-      editing = null; frozen = null;
+      // 回「我的标记」时草稿留着（多半是从「管理标签」回来）；去别处就算不写了
+      if (t.dataset.go === 'all') syncDraft(); else closeEditor();
       view = t.dataset.go === 'book' ? 'ctx' : t.dataset.go;
       render();
       sBody.scrollTop = 0;
@@ -2522,7 +2555,7 @@
         b.tags = []; b.review = '';
         DB.touch(b);
         DB.chapsOf(b.id).forEach((c) => { c.deleted = true; c.updatedAt = now(); });
-        DB.save(); editing = null; frozen = null; render(); paintAll(); toast('已清除这本的书评');
+        DB.save(); editing = null; draft = null; render(); paintAll(); toast('已清除这本的书评');
       });
       return;
     }
@@ -2624,46 +2657,53 @@
   });
 
   let searchTimer;
-  const rvTimers = {};
-  // 边打边存。关键是**存完不能重绘面板** —— 一重绘正在打字的框就被换掉，
-  // 光标和输入法都会丢。所以只 touch 数据 + 重画网页上的角标
-  function saveReview(bid, text) {
-    const b = text ? DB.editBook(bid) : DB.book(bid, false);
-    if (!b || b.review === text) return;
-    b.review = text;
-    DB.touch(b);
-    paintAll();          // 网页上的角标（有书评会显示 📝）跟着更新
+
+  // 打开某本书的编辑框：拿它现在的标签和书评起一份草稿
+  function openEditor(bid) {
+    const b = DB.book(bid, false) || { tags: [], review: '' };
+    editing = bid;
+    draft = { bid, tags: [...(b.tags || [])], review: b.review || '' };
   }
 
-  // 重绘列表前把编辑框里还没落盘的文字存下来（点标签、点「写好了」、切 tab
-  // 都会重绘）。一次只开一个编辑框，所以 querySelector 拿的就是那一个
-  function flushRvBox() {
+  // 编辑框里的文字只在 DOM 里，重绘前先抄回草稿（一次只开一个，所以就是那一个框）
+  function syncDraft() {
     const ta = sBody.querySelector('[data-rv]');
-    if (!ta) return;
-    const bid = ta.getAttribute('data-rv');
-    clearTimeout(rvTimers[bid]);
-    saveReview(bid, ta.value.trim());
+    if (ta && draft && ta.getAttribute('data-rv') === draft.bid) draft.review = ta.value;
   }
+
+  // 「写好了」：草稿写进书记录
+  function commitDraft() {
+    syncDraft();
+    if (!draft) return;
+    const b = DB.editBook(draft.bid);
+    b.tags = draft.tags.slice();
+    b.review = draft.review.trim();
+    DB.touch(b);
+    editing = null; draft = null;
+  }
+
+  /*
+   * 没点「写好了」就收起编辑框（切 tab、关面板、点别的书的铅笔……）：草稿作废。
+   * 真改过东西的话提一句，免得以为已经存上了。
+   */
+  function closeEditor() {
+    syncDraft();
+    if (draft) {
+      const b = DB.book(draft.bid, false) || { tags: [], review: '' };
+      const changed = draft.review.trim() !== (b.review || '') ||
+        draft.tags.join('\u0001') !== (b.tags || []).join('\u0001');
+      if (changed) toast('没点「写好了」，这次的改动没存');
+    }
+    editing = null; draft = null;
+  }
+
   sBody.addEventListener('input', (e) => {
     const rv = e.target.closest && e.target.closest('[data-rv]');
-    if (rv) {
-      const bid = rv.getAttribute('data-rv');
-      clearTimeout(rvTimers[bid]);
-      rvTimers[bid] = setTimeout(() => saveReview(bid, rv.value.trim()), 700);
-      return;
-    }
+    if (rv) { if (draft) draft.review = rv.value; return; }
     if (!e.target.matches('[data-search]')) return;
     searchKw = e.target.value;
     clearTimeout(searchTimer);
     searchTimer = setTimeout(paintList, 120); // 只重绘列表，输入框原地不动
-  });
-  // 失焦时立刻落一次，免得刚打完就切走、防抖还没到点
-  sBody.addEventListener('focusout', (e) => {
-    const rv = e.target.closest && e.target.closest('[data-rv]');
-    if (!rv) return;
-    const bid = rv.getAttribute('data-rv');
-    clearTimeout(rvTimers[bid]);
-    saveReview(bid, rv.value.trim());
   });
 
   // ==========================================================================
@@ -2979,7 +3019,7 @@
     if (!Page.native) { toast('这一页查不了喵，在站内页面再点'); return 0; }
 
     const due = DB.liveBooks()
-      .filter((b) => DB.prog(b.id) && b.done !== true &&
+      .filter((b) => DB.prog(b.id) && b.done !== true && !b.queued &&
                      !DB.isFinished(b.id) && !DB.isDropped(b.id))
       .sort((a, c) => (a.chapCheckedAt || 0) - (c.chapCheckedAt || 0));
     const list = due.slice(0, CHECK_MAX);
@@ -3095,10 +3135,14 @@
        * 有进度就在旁边放个「清除进度」—— 想重读、或者点错了记了一本没打算读的书，
        * 在书的主页上就地清掉，不用再翻进「我的标记」。点了会先问一句。
        */
-      const html = badge + (DB.prog(Page.bid)
-        ? `<span data-fw-progdel="${esc(Page.bid)}" style="margin-left:6px;` +
-          `color:#999;cursor:pointer;text-decoration:underline">清除进度</span>`
-        : '');
+      const link = (attr, txt) => `<span ${attr} style="margin-left:6px;` +
+        `color:#999;cursor:pointer;text-decoration:underline">${txt}</span>`;
+      // 「接下来看」主要就是在这儿点的 —— 还没读过的书，「我的标记」里压根没有它
+      const html = badge +
+        (DB.prog(Page.bid) ? link(`data-fw-progdel="${esc(Page.bid)}"`, '清除进度') : '') +
+        (b && b.queued
+          ? link(`data-fw-queue="${esc(Page.bid)}" data-on="1"`, '📌 已在接下来看')
+          : link(`data-fw-queue="${esc(Page.bid)}"`, '📌 接下来看'));
       if (box.innerHTML !== html) box.innerHTML = html;
     } else {
       /*
@@ -3350,7 +3394,7 @@
   document.addEventListener('click', (e) => {
     const t = e.target instanceof Element
       ? e.target.closest('[data-fw-mark],[data-fw-bmk],[data-fw-open],[data-fw-jump],' +
-        '[data-fw-done],[data-fw-progdel]') : null;
+        '[data-fw-done],[data-fw-progdel],[data-fw-queue]') : null;
     if (!t) return;
     e.preventDefault(); e.stopPropagation();
 
@@ -3372,6 +3416,18 @@
      * 最后一章末尾的「✓ 我读完了」：进度补成 100%、标上已读完，然后回书籍主页。
      * 补 100% 是故意的 —— 说读完了就别让进度还停在 93% 上刺眼。
      */
+    if (t.hasAttribute('data-fw-queue')) {
+      const on = !t.getAttribute('data-on');
+      const bid = t.getAttribute('data-fw-queue');
+      // 没读过的书多半还没有书记录，排队时顺手把书名记下，不然列表里只有个编号
+      if (bid === Page.bid) Page.noteBook(bid, Page.bookTitle, FW.catalogUrl(bid), true);
+      DB.setQueued(bid, on);
+      toast(on ? '排进「接下来看」了 📌' : '移出「接下来看」了');
+      paintAll();
+      if (sheet.classList.contains('on')) render();
+      return;
+    }
+
     // 标记条上那条进度：点了清掉这本书的进度（要确认，免得误触）
     if (t.hasAttribute('data-fw-progdel')) {
       const bid = t.getAttribute('data-fw-progdel');

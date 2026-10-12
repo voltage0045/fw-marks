@@ -38,7 +38,7 @@ python3 test/run-test.py
 
 === 单章固定链接页 ===           === 收藏 / 首页 / 频道 / 索引 ===
   ✅ 只认出 1 章（回帖没被算进来） ✅ 书名后挂上了标签
-189/189 通过
+206/206 通过
 ```
 
 覆盖的页面：首页、收藏、文库、书籍介绍、纯目录列表、正文、单章固定链接、
@@ -58,10 +58,13 @@ python3 test/run-test.py
 - 只在单章页记进度，论坛模式里滚动不许挪进度（`?fwtest=postrec` / `?fwtest=scroll`）
 - 云端进度只到「第几章」、同一章里滚动不改云端那份（`?fwtest=cloudprog`）
 - 黑夜模式：网页和面板都暗、我们的彩色小条不被洗灰（`?fwtest=dark`）
+- 编辑框是草稿：不点「写好了」就关掉，标签和书评都不许存（`?fwtest=discard`）；
+  面板开着时最上面那层是背景，点它关面板、不点到底下的链接（同一个用例）
 
 `?fwtest=<mode>` 是给断言脚本切场景用的：`strip` / `landing` / `scroll` / `legacy` /
 `dupbmk` / `progcleared` / `ratecleared` / `upd` / `crosstab` / `cidsowned` / `tagclick` /
-`lastchap` / `postrec` / `cloudprog` / `dark` / `listprog`（列表页上每本书都带进度，截图看位置用）/
+`lastchap` / `postrec` / `cloudprog` / `dark` / `discard`（编辑框不点「写好了」就关 + 点背景关面板）/
+`queuetoggle` / `dequeue` / `listprog`（列表页上每本书都带进度，截图看位置用）/
 `openpanel`（面板开着不关，截图用）。截图时 `dark` 再带 `&keep&panel` 就是黑着并开着面板。
 
 断言脚本要碰内部对象时用 `window.__fw`（`{ DB, Sync }`）。这个挂钩**只在
@@ -230,7 +233,7 @@ COLLECTIONS = ['books', 'chaps', 'bmks', 'prog']
 
 | 表 | 内容 |
 |---|---|
-| `books[书id]` | 书名、自定义标签、书评、章节 id 顺序（`cids`）、完结状态 |
+| `books[书id]` | 书名、自定义标签、书评、章节 id 顺序（`cids`）、完结状态、已读完（`doneRead`）、接下来看（`queued` / `queuedAt`） |
 | `prog[书id]` | 阅读进度：读到哪章、章内位置（`cpct`）、定位锚文本（`anchor`）、换章时间（`chapAt`） |
 | `chaps[书id\|章id]` | 章节标记（精彩/一般/跳过）。`note` 是 v1.10 及以前写的备注，现在只读不写 |
 | `bmks[书id\|章id-时间戳]` | 书签。**章级**：只记是哪一章，不记章内位置（v1.11 起） |
@@ -310,6 +313,13 @@ const steps = [['mig1','_mig1'], ['mig2','_mig2'], ['mig3','_mig3'],
 
 > 回归测试：`?fwtest=crosstab`（直接改存储假装另一个标签页写过，再触发本页写入），
 > 外加一条静态检查盯住 `_flush()` 里必须有 `mergeStored`。
+
+### 编辑框是草稿
+
+进度 tab 里 ✏️ 打开的编辑框改的是一份草稿（`draft`），只有「写好了」（`commitDraft`）
+才写进书记录；其他任何方式收起编辑框都走 `closeEditor`，草稿作废（改过东西会提示一句）。
+这样「点了弃坑，卡片当场跑去弃坑组」的问题自然就没了 —— 数据压根还没变。
+例外：去「✎ 管理」改标签再回来，草稿保留（改名 / 删除也同步改进草稿）。
 
 ### 「看得见却改不动」的书记录
 

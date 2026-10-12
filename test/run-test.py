@@ -41,6 +41,7 @@ TID = '279864'          # 有夹具的那本书
 BOGUS_TID = '280269'    # 用来验 v1.0 假数据迁移
 DONE_TID = '999001'     # 用来验「已完结且读完的书不算在读」
 DROP_TID = '999003'     # 用来验「打了弃坑的书排到进度栏最后、也不查新章」
+QUEUE_TID = '999004'    # 用来验「接下来看」：排在在读后面、不查新章
 # 两个页面数出来的章节数。写死是故意的 —— 夹具一变这条就会红，提醒去核对逻辑。
 #
 # 两者差 1 不是 bug：第 46 章是「单章限制阅读」，**只有书籍详情页列出来**，
@@ -142,6 +143,12 @@ SEED = {
             'id': DROP_TID, 'title': '弃坑的书', 'url': '', 'tags': ['弃坑'], 'review': '',
             'updatedAt': 1, 'chapTotal': 9, 'done': False,
         },
+        # 排进了「接下来看」：带着进度、章节数还故意记旧了 —— 查新章不该去查它
+        QUEUE_TID: {
+            'id': QUEUE_TID, 'title': '排队的书', 'url': '', 'tags': [], 'review': '',
+            'updatedAt': 1, 'chapTotal': 2, 'done': False,
+            'queued': True, 'queuedAt': 10,
+        },
         BOGUS_TID: {
             'id': BOGUS_TID, 'title': '旧版假数据', 'url': '', 'tags': [], 'review': '',
             'updatedAt': 1,
@@ -165,6 +172,11 @@ SEED = {
             'bid': DONE_TID, 'cid': '9001', 'title': '5 最终章',
             'url': '/posts/9001', 'no': 5,
             'pct': 0.99, 'cpct': 0.97, 'anchor': '', 'ts': 1, 'updatedAt': 3000,
+        },
+        QUEUE_TID: {
+            'bid': QUEUE_TID, 'cid': '9004', 'title': '1 开头',
+            'url': '/posts/9004', 'no': 1,
+            'pct': 0.1, 'cpct': 0.1, 'anchor': '', 'ts': 1, 'updatedAt': 8000,
         },
         # updatedAt 特意给最大：就算「最近才读过」，弃坑了也得排最后
         DROP_TID: {
@@ -207,6 +219,9 @@ SEED = {
     'mig3': True,
     'mig4': True,
     'mig5': True,
+    'mig6': True,
+    'mig7': True,
+    'mig8': True,
 }
 
 # 各列表页的样本书也塞进种子，统一打「列表验证」标签
@@ -461,6 +476,7 @@ CHECK_JS = r"""
       if (btn2) btn2.click();
       setTimeout(function () {
         var bk = (db().books || {})['__UPD__'] || {};
+        r.updQueuedTotal = ((db().books || {})['__QUEUE__'] || {}).chapTotal || null;
         r.updTotal = bk.chapTotal || null;
         r.updCheckedAt = bk.chapCheckedAt || null;
         r.updCids = (bk.cids || []).length;
@@ -500,6 +516,60 @@ CHECK_JS = r"""
     if (location.search.indexOf('fwtest=openpanel') >= 0) {
       var nv = document.querySelector('[data-fw-nav] [data-fw-open]');
       if (nv) nv.click();
+      return finish();
+    }
+
+    /* 编辑框里点了标签、写了字，但没点「写好了」就点背景关掉 —— 这次的改动不算数。
+     * 顺带验：面板开着时，背景盖住了底下网页的链接，点它是关面板、不是跳转。 */
+    if (location.search.indexOf('fwtest=discard') >= 0) {
+      var h5 = document.getElementById('__fw_marks__');
+      var sr5 = h5 && h5.shadowRoot;
+      var nav5 = document.querySelector('[data-fw-nav] [data-fw-open]');
+      if (nav5) nav5.click();
+      // 标题「我的标记」后面紧跟着 ⚙️
+      var gear = sr5 && sr5.querySelector('.gear');
+      r.gearShown = !!(gear && getComputedStyle(gear).display !== 'none');
+      r.gearAfterTitle = !!(gear && gear.previousElementSibling &&
+        gear.previousElementSibling.tagName === 'H3');
+      r.closeBtnKept = !!(sr5 && sr5.querySelector('.cls'));
+      var pen5 = sr5 && sr5.querySelector('[data-pen="__TID__"]');
+      if (pen5) pen5.click();
+      var chip5 = sr5 && sr5.querySelector('[data-btag="弃坑"][data-bk="__TID__"]');
+      if (chip5) chip5.click();
+      var ta5 = sr5 && sr5.querySelector('[data-rv="__TID__"]');
+      if (ta5) { ta5.value = '还没写完的书评'; ta5.dispatchEvent(new Event('input', { bubbles: true })); }
+      // 背景：它得是这个点上最上面那层（底下网页的链接点不着）
+      var hit = document.elementFromPoint(innerWidth / 2, 30);
+      r.backdropOnTop = hit === h5;
+      var mask5 = sr5 && sr5.querySelector('.mask');
+      var before5 = location.href;
+      if (mask5) mask5.click();
+      r.sheetClosed = !!(sr5 && !sr5.querySelector('.sheet').classList.contains('on'));
+      r.noNavigate = location.href === before5;
+      setTimeout(function () {
+        var bk5 = (db().books || {})['__TID__'] || {};
+        r.discardTags = (bk5.tags || []).join(',');
+        r.discardReview = bk5.review || '';
+        // 再打开 ⚙️：进的是设置
+        if (nav5) nav5.click();
+        var g2 = sr5 && sr5.querySelector('.gear');
+        if (g2) g2.click();
+        r.gearOpensCfg = sr5 ? sr5.querySelector('.sheet header h3').textContent : '';
+        finish();
+      }, 600);
+      return;
+    }
+
+    // 「接下来看」：在书籍详情页点一下就排进去；打开它的单章页就自动出队
+    if (location.search.indexOf('fwtest=queuetoggle') >= 0) {
+      var qb = document.querySelector('[data-fw-queue="__TID__"]');
+      r.queueLink = !!qb;
+      if (qb) qb.click();
+      r.queuedAfterClick = !!(((window.__fw && window.__fw.DB.d.books['__TID__']) || {}).queued);
+      return finish();
+    }
+    if (location.search.indexOf('fwtest=dequeue') >= 0) {
+      r.dequeued = !(((db().books || {})['__TID__'] || {}).queued);
       return finish();
     }
 
@@ -559,12 +629,17 @@ CHECK_JS = r"""
       setTimeout(function () {
         var c2 = sr3 && sr3.querySelector('[data-btag="弃坑"][data-bk="__TID__"]');
         r.tagChipOn = !!(c2 && c2.classList.contains('on'));
-        r.tagInStore = (((db().books || {})['__TID__'] || {}).tags || []).indexOf('弃坑') >= 0;
+        // 看内存里那份（存储是 250ms 防抖写的，读 localStorage 会早一步）
+        var memTags = function () {
+          return (((window.__fw && window.__fw.DB.d.books['__TID__']) || {}).tags || []);
+        };
+        r.tagInStore = memTags().indexOf('弃坑') >= 0;
         // 编辑框还开着 → 这本书原地不动，不着急挪去弃坑组
         r.tagStayedPut = order().indexOf('__TID__') === posBefore;
         r.tagEditorStillOpen = !!(sr3 && sr3.querySelector('[data-rv="__TID__"]'));
         var done = sr3 && sr3.querySelector('[data-pendone="__TID__"]');
         if (done) done.click();
+        r.tagInStoreAfterDone = memTags().indexOf('弃坑') >= 0;
         var o2 = order();
         // 写好了 → 才挪去弃坑组（排最后）
         r.tagMovedAfterDone = o2[o2.length - 1] === '__TID__';
@@ -666,7 +741,7 @@ CHECK_JS = r"""
 })();
 """.replace('__TID__', TID).replace('__BOGUS__', BOGUS_TID) \
    .replace('__PID_BMK__', PIDS[1]).replace('__PID_CLICK__', PID_CLICK) \
-   .replace('__UPD__', UPD_TID).replace('__DONE__', DONE_TID)
+   .replace('__UPD__', UPD_TID).replace('__DONE__', DONE_TID).replace('__QUEUE__', QUEUE_TID)
 
 
 # ?fwtest=landing 时预先塞进 sessionStorage 的「定位接力棒」，
@@ -722,6 +797,12 @@ def inject_html(html, query=''):
     elif 'fwtest=dark' in query:
         data = json.loads(json.dumps(SEED))
         data['cfg']['dark'] = True
+
+    elif 'fwtest=dequeue' in query:
+        # 这本书排在「接下来看」里，打开它的单章页 → 开始读了，该出队
+        data = json.loads(json.dumps(SEED))
+        data['books'][TID]['queued'] = True
+        data['books'][TID]['queuedAt'] = 10
 
     elif 'fwtest=tagclick' in query:
         # 书记录被软删过、但进度还活着（老数据里真实存在这种）。
@@ -1070,6 +1151,10 @@ def main():
             # 弃坑的排最后（即使它 updatedAt 最大），读完的排在它前面
             ('弃坑的排在进度栏最后',
              lambda r: (r.get('progOrder') or [None])[-1] == DROP_TID),
+            # 「接下来看」排在在读后面、读完前面（即使它带着进度、而且最近读过）
+            ('接下来看排在在读和读完之间',
+             lambda r: (lambda o: QUEUE_TID in o and o.index(TID) < o.index(QUEUE_TID)
+                        < o.index(DONE_TID))(r.get('progOrder') or [])),
             ('读完的排在弃坑之前',
              lambda r: (r.get('progOrder') or []).index(DONE_TID)
              < (r.get('progOrder') or []).index(DROP_TID)),
@@ -1084,11 +1169,11 @@ def main():
             ('最近读的书排在列表最前', lambda r: (r.get('allListOrder') or [None])[0] == TID),
             ('进度 tab 列出了多本书（排序才有意义）',
              lambda r: len(r.get('allListOrder') or []) >= 2),
-            # 书评并进来之后，没进度但打过标签的书也得在这儿（「没有进度」那组）
-            ('没进度但评过的书也列出来了',
-             lambda r: LIST_TIDS['home'] in (r.get('allListOrder') or [])),
-            ('读完 / 没有进度 / 弃坑 三组有分组标题',
-             lambda r: set(r.get('grpTitles') or []) >= {'finished', 'none', 'dropped'}),
+            # 没进度、也没排进「接下来看」、也没弃坑的书不列
+            ('没进度又没排队的书不列',
+             lambda r: LIST_TIDS['home'] not in (r.get('allListOrder') or [])),
+            ('在读 / 读完了 / 弃坑 都有分组标题（在读也能收起来）',
+             lambda r: set(r.get('grpTitles') or []) >= {'reading', 'finished', 'dropped'}),
             ('点分组标题能收起来，并记住', lambda r: r.get('foldHidesDone') is True
              and r.get('foldSaved') is True),
             ('再点一下展开回来',       lambda r: r.get('unfoldShowsDone') is True),
@@ -1217,13 +1302,16 @@ def main():
              lambda r: r.get('updTotal') == CHAP_TOTAL_PROFILE
              and r.get('updCids') == CHAP_TOTAL_PROFILE),
             ('记下了这次查过的时间', lambda r: (r.get('updCheckedAt') or 0) > 1),
+            ('「接下来看」的书不查',   lambda r: r.get('updQueuedTotal') == 2),
             ('没有 JS 报错',        lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}?fwtest=tagclick', '进度 tab 里打弃坑 → 写好了才挪组', [
             ('进度 tab 列出了这本',   lambda r: r.get('tagProgListed') == 1),
             ('书名后有铅笔',          lambda r: r.get('tagPen') is True),
             ('编辑块里有标签格子',    lambda r: r.get('tagChip') is True),
-            ('点完标签真写进存储了',  lambda r: r.get('tagInStore') is True),
+            # 没点「写好了」之前只改了草稿，存储里还没有
+            ('点标签只改草稿、还没存', lambda r: r.get('tagInStore') is False),
+            ('点「写好了」才存进去',   lambda r: r.get('tagInStoreAfterDone') is True),
             ('格子立刻变成选中态',    lambda r: r.get('tagChipOn') is True),
             # 编辑框开着时点了「弃坑」，卡片原地不动；点「写好了」才挪到弃坑组
             ('编辑框开着时原地不动',  lambda r: r.get('tagStayedPut') is True
@@ -1237,7 +1325,9 @@ def main():
         (f'/collection/{UID}?fwtest=tagclick',
          '进度 tab 里打标签（书记录被软删过、且这一页不会自愈）', [
             ('进度 tab 列出了这本',   lambda r: r.get('tagProgListed') == 1),
-            ('点完标签真写进存储了',  lambda r: r.get('tagInStore') is True),
+            # 没点「写好了」之前只改了草稿，存储里还没有
+            ('点标签只改草稿、还没存', lambda r: r.get('tagInStore') is False),
+            ('点「写好了」才存进去',   lambda r: r.get('tagInStoreAfterDone') is True),
             ('格子立刻变成选中态',    lambda r: r.get('tagChipOn') is True),
             ('写好了之后标签显示出来了', lambda r: r.get('tagRateListed') == 1
              and '弃坑' in r.get('tagRateTitle', '')),
@@ -1270,6 +1360,27 @@ def main():
             ('记下了，下次开页面能抢先套上', lambda r: r.get('darkFlag') == '1'),
             ('点 🌙 一键关掉',         lambda r: r.get('darkOffStyle') is False
              and r.get('darkOffFlag') == '0'),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=discard', '没点「写好了」就关掉 → 不算数；点背景是关面板', [
+            ('设置 ⚙️ 紧跟在标题「我的标记」后面', lambda r: r.get('gearShown') is True
+             and r.get('gearAfterTitle') is True),
+            ('关闭按钮还在',           lambda r: r.get('closeBtnKept') is True),
+            ('面板开着时背景压在网页上面', lambda r: r.get('backdropOnTop') is True),
+            ('点背景 = 关面板、不跳转', lambda r: r.get('sheetClosed') is True
+             and r.get('noNavigate') is True),
+            ('没点写好了，标签没存',   lambda r: '弃坑' not in r.get('discardTags', '')),
+            ('没点写好了，书评没改',   lambda r: r.get('discardReview') == '总评测试'),
+            ('点 ⚙️ 进的是设置',       lambda r: r.get('gearOpensCfg') == '设置'),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=queuetoggle', '详情页点「接下来看」', [
+            ('站点标签下那行有「接下来看」', lambda r: r.get('queueLink') is True),
+            ('点了就排进去了',         lambda r: r.get('queuedAfterClick') is True),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/posts/{PID_PROGRESS}?fwtest=dequeue', '排队的书一开读就出队', [
+            ('开始读了，移出「接下来看」', lambda r: r.get('dequeued') is True),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/threads/{TID}?fwtest=crosstab', '两个标签页同时写 → 不许互相冲掉', [
