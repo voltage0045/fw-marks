@@ -342,6 +342,12 @@ CHECK_JS = r"""
       // 详情页：角标挂在站点那排标签的下一行
       metaBox: n('[data-fw-meta]'),
       metaText: txt('[data-fw-meta]').slice(0, 300),
+      metaPen: n('[data-fw-meta] [data-fw-open="book"]'),
+      // 站点那个空着的广告位（ins.adsbygoogle）要收起来，不然章末白一大片
+      // 只看「空着的」：真被广告填上了（里面有元素）就不归我们管
+      emptyAdShown: [].filter.call(document.querySelectorAll('ins.adsbygoogle'),
+        function (e) { return !e.children.length && getComputedStyle(e).display !== 'none'; }).length,
+      emptyAds: n('ins.adsbygoogle'),
       learnedDone: real ? (real.done === undefined ? null : real.done) : null,
       learnedNo: ((d.prog || {})['__TID__'] || {}).no || null,
       // v1.5：进度搬进独立的 prog 表，书记录里那个字段要消失
@@ -512,6 +518,9 @@ CHECK_JS = r"""
       r.darkFlag = localStorage.getItem('__fwm__dark');
       var pillEl = document.querySelector('[data-fw-jump]');
       r.darkPillBg = pillEl ? getComputedStyle(pillEl).backgroundColor : '';
+      // 要验的是顶栏里那个「我要签到」（回帖框里也有个 .warning-tag，别拿错）
+      var warn = document.querySelector('header .warning-tag, .navbar .warning-tag');
+      r.darkWarn = warn ? getComputedStyle(warn).color : '';
       r.darkSheetBg = hd && hd.shadowRoot
         ? getComputedStyle(hd.shadowRoot.querySelector('.sheet')).backgroundColor : '';
       // 带 &keep 是截图用：保持黑着，不去验关掉那一步（再带 &panel 就把面板也开着）
@@ -633,6 +642,74 @@ CHECK_JS = r"""
           finish();
         }, 400);
       }, 400);
+      return;
+    }
+
+    // 详情页：打了弃坑、又有进度 → 只出现一个「✕ 弃坑」，标签里不再挂一遍
+    if (location.search.indexOf('fwtest=dropdup') >= 0) {
+      r.dropMeta = txt('[data-fw-meta]');
+      return finish();
+    }
+
+    // 「这本书」面板：点标签只改草稿，点「保存」才写进去；没保存就关 = 不算
+    if (location.search.indexOf('fwtest=bookdraft') >= 0) {
+      var h7 = document.getElementById('__fw_marks__');
+      var sr7 = h7 && h7.shadowRoot;
+      var pen7 = document.querySelector('[data-fw-meta] [data-fw-open="book"]');
+      if (pen7) pen7.click();
+      r.bdOpened = !!(sr7 && sr7.querySelector('[data-act="saveBook"]'));
+      var mem = function () {
+        return ((window.__fw && window.__fw.DB.d.books['__TID__']) || {});
+      };
+      var c7 = sr7 && sr7.querySelector('[data-tag="弃坑"]');
+      if (c7) c7.click();
+      r.bdChipOn = !!(sr7 && (sr7.querySelector('[data-tag="弃坑"]') || {}).classList &&
+        sr7.querySelector('[data-tag="弃坑"]').classList.contains('on'));
+      r.bdNotYet = (mem().tags || []).indexOf('弃坑') < 0;
+      // 页面上也不许冒出弃坑
+      r.bdPageNotYet = txt('[data-fw-meta]').indexOf('弃坑') < 0;
+      var mk7 = sr7 && sr7.querySelector('.mask');
+      if (mk7) mk7.click();                       // 不保存直接关
+      r.bdDiscarded = (mem().tags || []).indexOf('弃坑') < 0;
+      if (pen7) pen7.click();
+      c7 = sr7 && sr7.querySelector('[data-tag="弃坑"]');
+      r.bdReopenClean = !!(c7 && !c7.classList.contains('on'));
+      if (c7) c7.click();
+      var sv = sr7 && sr7.querySelector('[data-act="saveBook"]');
+      if (sv) sv.click();
+      setTimeout(function () {
+        r.bdSaved = (mem().tags || []).indexOf('弃坑') >= 0;
+        finish();
+      }, 400);
+      return;
+    }
+
+    // 预载下一章：读过一半就抓下来，点「下一章」原地换过去，不整页重新加载
+    if (location.search.indexOf('fwtest=prefetch') >= 0) {
+      window.__notReloaded = 1;
+      var post8 = document.querySelector('[id^="post"]');
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      setTimeout(function () {
+        var P = window.__fw && window.__fw.Pre;
+        r.preUrl = P ? (P.url || '') : '';
+        r.preReady = !!(P && P.doc);
+        var nx = [].filter.call(document.querySelectorAll('a[href*="/posts/"]'),
+          function (a) { return a.textContent.trim() === '下一章'; }).pop();
+        r.nextHref = nx ? nx.getAttribute('href') : '';
+        if (nx) nx.click();
+        setTimeout(function () {
+          r.swPath = location.pathname;
+          r.swNoReload = window.__notReloaded === 1;
+          r.swNewBlock = !!document.getElementById('post__PID_NEXT__');
+          r.swOldGone = !document.getElementById('post__PID_PROGRESS__');
+          r.swBars = n('[data-fw-bar]');
+          r.swTop = Math.round(window.scrollY);
+          setTimeout(function () {
+            r.swProg = ((window.__fw.DB.d.prog || {})['__TID__'] || {}).cid || '';
+            finish();
+          }, 1200);
+        }, 600);
+      }, 2000);
       return;
     }
 
@@ -804,7 +881,8 @@ CHECK_JS = r"""
 })();
 """.replace('__TID__', TID).replace('__BOGUS__', BOGUS_TID) \
    .replace('__PID_BMK__', PIDS[1]).replace('__PID_CLICK__', PID_CLICK) \
-   .replace('__UPD__', UPD_TID).replace('__DONE__', DONE_TID).replace('__QUEUE__', QUEUE_TID)
+   .replace('__UPD__', UPD_TID).replace('__DONE__', DONE_TID).replace('__QUEUE__', QUEUE_TID).replace('__PID_NEXT__', PIDS[1]) \
+   .replace('__PID_PROGRESS__', PID_PROGRESS)
 
 
 # ?fwtest=landing 时预先塞进 sessionStorage 的「定位接力棒」，
@@ -866,6 +944,14 @@ def inject_html(html, query=''):
         data = json.loads(json.dumps(SEED))
         data['books'][TID]['queued'] = True
         data['books'][TID]['queuedAt'] = 10
+
+    elif 'fwtest=dropdup' in query:
+        data = json.loads(json.dumps(SEED))
+        data['books'][TID]['tags'] = ['弃坑']
+
+    elif 'fwtest=bookdraft' in query:
+        data = json.loads(json.dumps(SEED))
+        data['books'][TID]['tags'] = []
 
     elif 'fwtest=tagclick' in query:
         # 书记录被软删过、但进度还活着（老数据里真实存在这种）。
@@ -995,7 +1081,13 @@ class H(http.server.BaseHTTPRequestHandler):
             return self._send(inject_html(routes_page(path, False), query))
 
         with open(fixture, encoding='utf-8') as f:
-            return self._send(inject_html(f.read(), query))
+            html = f.read()
+        # 单章页夹具只有一章（id 写死的）。按请求的 id 换掉，
+        # 这样「预载下一章 → 原地换过去」才能真的换到另一章上
+        m = re.match(r'^/posts/(\d+)$', path)
+        if m and fixture.endswith('post.html'):
+            html = html.replace(PID_PROGRESS, m.group(1))
+        return self._send(inject_html(html, query))
 
 
 def serve():
@@ -1194,7 +1286,9 @@ def main():
             ('有书签的章节挂了 🔖',    lambda r: '🔖' in r['badgeText']),
             ('有「上次读到」提示条',   lambda r: r['strips'] == 1 and '上次读到' in r['stripText']),
             ('书签没有「改名」按钮',   lambda r: r['renameBtns'] == 0),
-            ('目录上方有 3 个操作按钮', lambda r: r['pageActions'] == 3),
+            # 目录上方那排入口（标签/书评/书签 · 我的标记 · ⚙️）删了，缩成一支铅笔
+            ('目录上方那排入口没了',   lambda r: r['pageActions'] == 0),
+            ('站点标签下那行有 ✏️',    lambda r: r.get('metaPen') == 1),
             ('顶栏那一项写着「我的标记」', lambda r: '我的标记' in r['navText']),
             ('点顶栏入口能打开面板',   lambda r: r['navOpens'] is True),
             ('tab 栏整个没了（只剩一张书单）', lambda r: r.get('tabCount') == 0),
@@ -1338,6 +1432,8 @@ def main():
             ('只认出 1 章（回帖没被算进来）', lambda r: r['bars'] == 1),
             ('标记条挂上了',           lambda r: r['markBtns'] == 3 and r['bmkBtns'] == 1),
             ('章末也挂了一条',         lambda r: r['endBars'] == 1),
+            ('站点的空广告位收起来了', lambda r: r.get('emptyAds', 0) >= 1
+             and r.get('emptyAdShown') == 0),
             ('本章标签识别正确',       lambda r: '精彩' in r['barsText']),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
@@ -1469,6 +1565,38 @@ def main():
             ('标题栏里的 ⚙️ 照常能点', lambda r: r.get('dragGearWorks') is True),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
+        (f'/threads/{TID}/profile?fwtest=dropdup', '详情页弃坑只出现一次', [
+            ('只有一个「✕ 弃坑」', lambda r: r.get('dropMeta', '').count('弃坑') == 1
+             and '✕ 弃坑' in r.get('dropMeta', '')),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/threads/{TID}/profile?fwtest=bookdraft', '「这本书」面板：点保存才算数', [
+            ('铅笔打开的是「这本书」面板', lambda r: r.get('bdOpened') is True),
+            ('点标签：格子亮了，但还没存', lambda r: r.get('bdChipOn') is True
+             and r.get('bdNotYet') is True),
+            ('页面上也没提前冒出弃坑', lambda r: r.get('bdPageNotYet') is True),
+            ('不保存就关 → 作废',      lambda r: r.get('bdDiscarded') is True
+             and r.get('bdReopenClean') is True),
+            ('点保存才写进去',         lambda r: r.get('bdSaved') is True),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        (f'/posts/{PID_PROGRESS}?fwtest=prefetch', '预载下一章 → 点了原地换过去', [
+            ('读过一半就开始预载',     lambda r: r.get('preUrl', '').endswith('/posts/' + PIDS[1])),
+            ('抓下来了',               lambda r: r.get('preReady') is True),
+            ('点「下一章」地址换了',   lambda r: r.get('swPath') == '/posts/' + PIDS[1]),
+            ('没有整页重新加载',       lambda r: r.get('swNoReload') is True),
+            ('正文换成了下一章',       lambda r: r.get('swNewBlock') is True
+             and r.get('swOldGone') is True),
+            ('新的一章也挂上了标记条', lambda r: r.get('swBars') == 1),
+            ('滚回了顶上',             lambda r: r.get('swTop') == 0),
+            ('进度记到了新的一章',     lambda r: r.get('swProg') == PIDS[1]),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
+        # 详情页夹具的顶栏里没有「我要签到」，单章页的有
+        (f'/posts/{PID_PROGRESS}?fwtest=dark&keep', '黑夜模式下的站点提醒色', [
+            ('「我要签到」还是红的',   lambda r: r.get('darkWarn') == 'rgb(255, 123, 123)'),
+            ('没有 JS 报错',          lambda r: not r['jsErrors']),
+        ]),
         (f'/threads/{TID}?fwtest=crosstab', '两个标签页同时写 → 不许互相冲掉', [
             ('确实触发了本页的写入', lambda r: r.get('crossTriggered') is True),
             ('另一个标签页刚记的进度还在',
@@ -1583,7 +1711,7 @@ def main():
             if not ok:
                 failed_cases.append(f'{label} / {name}')
                 if os.environ.get('FW_DEBUG'):
-                    print('     debug:', json.dumps({k:r.get(k) for k in ('bmkBtn','bmkListBefore','bmkListItems')}, ensure_ascii=False)[:500])
+                    print('     debug:', json.dumps({k:r.get(k) for k in ('emptyAds','emptyAdShown')}, ensure_ascii=False)[:500])
             print(f'  {"✅" if ok else "❌"} {name}')
         if r['jsErrors']:
             print('   JS 报错：', r['jsErrors'])

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.17.0
+// @version      1.18.0
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -76,6 +76,10 @@
     html body header:not([style*="background"]),
     html body .navbar:not([style*="background"]) { background-color: #0c0c0e !important; }
     html body ::placeholder { color: #6e6e76 !important; }
+    /* 站点自己标红的提醒（「我要签到」之类，.warning-tag）黑夜里也得是红的 */
+    /* 类名写两遍是故意的：要压过上面「顶栏链接一律调亮」那条（.navbar a） */
+    html body .warning-tag.warning-tag:not([style*="color"]) { color: #ff7b7b !important; }
+    html body .reminder-sign.reminder-sign:not([style*="color"]) { color: #ffc23a !important; }
     html body img { filter: brightness(.88); }
   `;
   function darkStyle(on) {
@@ -90,6 +94,18 @@
     }
   }
   try { if (localStorage.getItem(DARK_KEY) === '1') darkStyle(true); } catch (e) {}
+
+  /*
+   * 章末那一大片空白是站点的广告位（ins.adsbygoogle，写死 640×200）。
+   * 广告没加载出来时它是个空壳，白白占着 200px —— 只把**空的**收起来，
+   * 真有广告填进去（里面有了 iframe）就不碰它。
+   */
+  {
+    const st = document.createElement('style');
+    st.textContent = 'ins.adsbygoogle:empty, ins.adsbygoogle[data-ad-status="unfilled"]' +
+      '{ display: none !important; }';
+    (document.head || document.documentElement).appendChild(st);
+  }
 
   // 剩下的事都要等 DOM 好了再做
   if (document.readyState === 'loading') {
@@ -1538,9 +1554,94 @@
     return true;
   }
 
+  /*
+   * ---- 预载下一章 ----
+   * 单章页读过一半，就悄悄把下一章的页面抓下来；点「下一章」时不走整页跳转，
+   * 直接把正文那一块换成新的（地址栏也跟着换），所以不用等加载。
+   *
+   * 缓存什么时候扔：
+   *   · 只存在内存里、只存下一章一份 —— 不占手机存储，也不同步
+   *   · 换过去了 / 离开这一页 / 关掉标签页，自然就没了
+   *   · 抓下来超过 10 分钟还没点，就当过期（作者可能改了字），点的时候重新正常加载
+   * 抓到的不对劲（撞上 WAF 验证页、页面结构对不上）一律不用，退回正常跳转。
+   */
+  const Pre = { url: null, doc: null, at: 0, job: null };
+  const PRE_TTL = 10 * 60 * 1000;
+  let shownPath = location.pathname;
+
+  // 本章自带的「下一章」按钮（最后一章没有 —— 那儿写的是「最后一章」）
+  function nextLink() {
+    if (!Page.native || !Page.single || !Page.chapters.length) return null;
+    const as = [...Page.chapters[0].el.querySelectorAll('a[href*="/posts/"]')]
+      .filter((a) => (a.textContent || '').trim() === '下一章');
+    return as.length ? as[as.length - 1].href : null;
+  }
+
+  function prefetchNext() {
+    if (DB.d.cfg.prefetch === false) return;
+    const url = nextLink();
+    if (!url || Pre.url === url) return;
+    const pid = (url.match(/\/posts\/(\d+)/) || [])[1];
+    Pre.url = url; Pre.doc = null;
+    Pre.job = fetch(url, { credentials: 'same-origin' })
+      .then((r) => (r.ok ? r.text() : ''))
+      .then((html) => {
+        if (Pre.url !== url) return null;
+        const doc = html && !/awsWafCookieDomainList/.test(html)
+          ? new DOMParser().parseFromString(html, 'text/html') : null;
+        // 必须真是一章（带「上一章 / 目录 / 下一章」那排），不是就不用
+        if (!doc || !doc.querySelector('#post' + pid + ' ' + FW.SEL.chapNav)) {
+          Pre.url = null; return null;
+        }
+        Pre.doc = doc; Pre.at = now();
+        return doc;
+      })
+      .catch(() => { Pre.url = null; return null; });
+  }
+
+  // 读到这一章的一半就开始预载
+  function maybePrefetch() {
+    const ch = Page.chapters[0];
+    if (!Page.single || !ch || Pre.url) return;
+    const r = ch.el.getBoundingClientRect();
+    if (r.height > 0 && (innerHeight - r.top) / r.height > 0.5) prefetchNext();
+  }
+
+  // 点「下一章」：有预载好的就原地换，没有（或还没抓完、等不及）就正常跳
+  async function goNext(url) {
+    let doc = Pre.url === url && now() - Pre.at < PRE_TTL ? Pre.doc : null;
+    if (!doc && Pre.url === url && Pre.job) {
+      doc = await Promise.race([Pre.job, new Promise((r) => setTimeout(() => r(null), 2500))]);
+    }
+    const pid = (url.match(/\/posts\/(\d+)/) || [])[1];
+    const fresh = doc && doc.querySelector('#post' + pid);
+    const nextWrap = fresh && fresh.closest('.container-fluid');
+    const curWrap = Page.chapters[0] && Page.chapters[0].el.closest('.container-fluid');
+    if (!nextWrap || !curWrap) { location.href = url; return; }
+
+    Progress.record();                       // 这一章读到的位置先落下
+    DB.saveNow();
+    curWrap.replaceWith(document.importNode(nextWrap, true));
+    document.title = doc.title;
+    history.pushState({ fw: 1 }, '', url);
+    shownPath = location.pathname;
+    Pre.url = null; Pre.doc = null; Pre.job = null;
+    window.scrollTo(0, 0);
+    Page.detect();
+    paintAll();
+    setTimeout(() => { syncFocus(); Progress.record(); }, 800);
+  }
+
+  // 换过章之后按「返回」：地址栏回去了，页面内容还是新的 —— 重新加载那一页
+  // （只认路径变了的情况：点「回复」这种 #锚点 也会触发 popstate，别误伤）
+  addEventListener('popstate', () => {
+    if (location.pathname !== shownPath) location.reload();
+  });
+
   if (Page.type === 'chapter') {
     let t = null;
     addEventListener('scroll', () => {
+      maybePrefetch();
       // 换章只更新「当前章」指针，不重绘面板
       syncFocus();
       clearTimeout(t);
@@ -1548,7 +1649,16 @@
       t = setTimeout(() => Progress.record(), 450);
     }, { passive: true });
     // 进正文页先记一次，至少知道读到哪章了
-    setTimeout(() => { syncFocus(); Progress.record(); }, 800);
+    setTimeout(() => { syncFocus(); Progress.record(); maybePrefetch(); }, 800);
+
+    // 点「下一章」：预载过的就原地换
+    document.addEventListener('click', (e) => {
+      const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
+      if (!a || !Pre.url || a.href !== Pre.url) return;
+      if (e.button || e.metaKey || e.ctrlKey || e.shiftKey) return;   // 新标签页打开的不管
+      e.preventDefault(); e.stopPropagation();
+      goNext(a.href);
+    }, true);
 
     // 刚从书签/继续读跳过来 → 直接复位，不再问「回去吗」
     const jump = takePendingJump();
@@ -1823,6 +1933,7 @@
   function closeSheet() {
     mask.classList.remove('on'); sheet.classList.remove('on');
     closeEditor();    // 下次打开不要还挂着上次那个展开的编辑框
+    dropBDraft();
   }
   // 页面上各处入口统一走这里
   function openView(v) { openSheet(v === 'book' ? 'ctx' : v); }
@@ -1866,7 +1977,7 @@
   $('.cls').onclick = closeSheet;
   // 标题「我的标记」后面那个 ⚙️：直接进设置
   $('.gear').onclick = () => {
-    closeEditor();
+    closeEditor(); dropBDraft();
     view = 'cfg';
     render();
     sBody.scrollTop = 0;
@@ -1902,6 +2013,7 @@
   // 认得出书就渲染「这本书」。章节那点事（标记 / 书签）全在正文里内联做完了，
   // 不需要单独的章节面板
   function render() {
+    syncBDraft();         // 面板要重画了：先把书评框里还没存的字抄回草稿
     $('.gear').classList.toggle('on', view === 'all' || (view !== 'cfg' && !Page.bid));
     if (view === 'all') return renderAll();
     if (view === 'cfg') return renderCfg();
@@ -1971,6 +2083,11 @@
   function renderBook() {
     if (!Page.bid) return renderUnknown('书籍');
     const b = DB.book(Page.bid, true);
+    // 标签和书评是草稿，点「保存」才写进去（和「我的标记」里的编辑框一个规矩）
+    if (!bdraft || bdraft.bid !== b.id) {
+      bdraft = { bid: b.id, tags: [...(b.tags || [])], review: b.review || '' };
+    }
+    const bd = bdraft;
     const pg = DB.prog(Page.bid);
     // note 已经不能再写了（章节内只留书签），但老数据里存量的备注还得认，
     // 不然以前写过的东西会凭空消失
@@ -1996,14 +2113,14 @@
       <div class="row">
         <label>书籍标签（点一下选中／取消）</label>
         <div class="tags">
-          ${pool.map((t) => `<span class="t ${b.tags.includes(t) ? 'on' : ''}" data-tag="${esc(t)}">${esc(t)}</span>`).join('')}
+          ${pool.map((t) => `<span class="t ${bd.tags.includes(t) ? 'on' : ''}" data-tag="${esc(t)}">${esc(t)}</span>`).join('')}
           <span class="t add" data-act="newtag">＋ 新标签</span>
           <span class="t add" data-tagmgr>✎ 管理</span>
         </div>
       </div>
       <div class="row">
         <label>书评</label>
-        <textarea data-review placeholder="这本书读下来感觉如何…">${esc(b.review)}</textarea>
+        <textarea data-review placeholder="这本书读下来感觉如何…（点「保存」才算数）">${esc(bd.review)}</textarea>
       </div>
       <div class="btns"><button class="btn" data-act="saveBook">保存</button></div>
       ${navBtns()}
@@ -2029,6 +2146,7 @@
    * 所以在编辑框里点了「弃坑」，卡片也不会当场跑去弃坑组：数据压根还没变。
    */
   let draft = null;      // { bid, tags: [...], review: '' }
+  let bdraft = null;     // 「这本书」面板的草稿，规矩同上
 
   function renderAll(kw) {
     if (kw !== undefined) searchKw = kw;
@@ -2324,6 +2442,15 @@
         <div class="hint">网页和这个面板一起变暗。面板右上角那个 🌙 也能随手切。</div>
       </div>
 
+      <div class="row">
+        <label>⚡ 预载下一章
+          <span class="sw ${c.prefetch !== false ? 'on' : ''}" data-prefetch role="switch"
+            aria-checked="${c.prefetch !== false}"></span>
+        </label>
+        <div class="hint">单章页读过一半，就先把下一章抓下来，点「下一章」不用等加载。
+          只存在内存里、只存一章，换过去或离开页面就扔了。</div>
+      </div>
+
       <div class="hint" style="margin:0 0 16px;background:#8881;padding:10px;border-radius:9px">
         两个云端是<b>互为备份</b>喵：同步时两边都拉下来，和本地<b>逐条比时间戳取最新</b>，
         再把合并结果推回两边——落后的那边会被自动补齐，一边挂了另一边照常用。
@@ -2419,11 +2546,18 @@
     const t = e.target.closest('[data-act],[data-go],[data-tag],[data-jump],[data-ratedel],' +
       '[data-toggle],[data-bmkgo],[data-bmkdel],[data-bmktoggle],[data-bmkonly],[data-chkgrp],' +
       '[data-progdel],[data-backon],[data-pen],[data-pendone],[data-btag],[data-newtag],' +
-      '[data-doneread],[data-tagmgr],[data-tagren],[data-tagdel],[data-fold],[data-dark],' +
+      '[data-doneread],[data-tagmgr],[data-tagren],[data-tagdel],[data-fold],[data-dark],[data-prefetch],' +
       '[data-queue]');
     if (!t) return;
 
     // 某个云端的总开关：关掉就不参与同步，设置里也折叠起来不占地方
+    if (t.hasAttribute('data-prefetch')) {
+      DB.d.cfg.prefetch = DB.d.cfg.prefetch === false;
+      DB.save();
+      render();
+      return;
+    }
+
     if (t.hasAttribute('data-dark')) {
       setDark(!DB.d.cfg.dark);
       render();
@@ -2503,7 +2637,7 @@
 
     // 去「管理标签」改个错别字再回来，编辑框里的草稿得还在
     if (t.hasAttribute('data-tagmgr')) {
-      syncDraft();
+      syncDraft(); syncBDraft();
       view = 'tags'; render(); sBody.scrollTop = 0;
       return;
     }
@@ -2512,7 +2646,9 @@
       const to = prompt('改成什么？', from);
       if (to !== null && to.trim() && to.trim() !== from) {
         const n = DB.renameTag(from, to.trim());
-        if (draft) draft.tags = [...new Set(draft.tags.map((x) => (x === from ? to.trim() : x)))];
+        for (const d of [draft, bdraft]) {
+          if (d) d.tags = [...new Set(d.tags.map((x) => (x === from ? to.trim() : x)))];
+        }
         toast(`改好了，顺手改了 ${n} 本书上的 ✓`);
         render(); paintAll();
       }
@@ -2522,7 +2658,7 @@
       const tag = t.dataset.tagdel;
       confirmBar(`删掉标签「${tag}」？所有书上这个标签也一起去掉`, () => {
         const n = DB.renameTag(tag, '');
-        if (draft) draft.tags = draft.tags.filter((x) => x !== tag);
+        for (const d of [draft, bdraft]) if (d) d.tags = d.tags.filter((x) => x !== tag);
         toast(`删了，顺手清了 ${n} 本书上的`);
         render(); paintAll();
       });
@@ -2582,6 +2718,7 @@
     if (t.dataset.go) {
       // 回「我的标记」时草稿留着（多半是从「管理标签」回来）；去别处就算不写了
       if (t.dataset.go === 'all') syncDraft(); else closeEditor();
+      if (t.dataset.go !== 'book') dropBDraft();   // 回「这本书」时草稿留着（多半是从管理标签回来）
       view = t.dataset.go === 'book' ? 'ctx' : t.dataset.go;
       render();
       sBody.scrollTop = 0;
@@ -2605,18 +2742,24 @@
       return;
     }
     if (t.dataset.tag) {
-      const b = DB.book(Page.bid, true);
+      if (!bdraft) return;
+      syncBDraft();
       const tag = t.dataset.tag;
-      b.tags = b.tags.includes(tag) ? b.tags.filter((x) => x !== tag) : [...b.tags, tag];
-      if (!b.title && Page.bookTitle) b.title = Page.bookTitle;
-      DB.touch(b); render(); paintAll();
+      bdraft.tags = bdraft.tags.includes(tag)
+        ? bdraft.tags.filter((x) => x !== tag) : [...bdraft.tags, tag];
+      render();
       return;
     }
 
     switch (t.dataset.act) {
       case 'saveBook': {
-        const b = DB.book(Page.bid, true);
-        b.review = sBody.querySelector('[data-review]').value.trim();
+        syncBDraft();
+        const b = DB.editBook(Page.bid);
+        if (bdraft && bdraft.bid === b.id) {
+          b.tags = bdraft.tags.slice();
+          b.review = bdraft.review.trim();
+        }
+        bdraft = null;
         if (!b.title) b.title = Page.bookTitle;
         b.url = b.url || (Page.native ? FW.catalogUrl(Page.bid) : location.href);
         DB.touch(b); await DB.saveNow();
@@ -2625,12 +2768,11 @@
       }
       case 'newtag': {
         const v = prompt('新标签（比如：甜文 / 追更中 / 弃坑）');
-        if (v && v.trim()) {
-          DB.addTag(v.trim());
-          const b = DB.book(Page.bid, true);
-          if (!b.tags.includes(v.trim())) b.tags.push(v.trim());
-          if (!b.title && Page.bookTitle) b.title = Page.bookTitle;
-          DB.touch(b); render(); paintAll();
+        if (v && v.trim() && bdraft) {
+          syncBDraft();
+          DB.addTag(v.trim());               // 标签池只是个候选列表，直接加
+          if (!bdraft.tags.includes(v.trim())) bdraft.tags.push(v.trim());
+          render();
         }
         break;
       }
@@ -2698,6 +2840,22 @@
   });
 
   let searchTimer;
+
+  // 「这本书」面板的草稿（和上面「我的标记」那份分开：两处可能各开着一本）
+  function syncBDraft() {
+    const ta = sBody.querySelector('[data-review]');
+    if (ta && bdraft) bdraft.review = ta.value;
+  }
+  function dropBDraft() {
+    syncBDraft();
+    if (bdraft) {
+      const b = DB.book(bdraft.bid, false) || { tags: [], review: '' };
+      const changed = bdraft.review.trim() !== (b.review || '') ||
+        bdraft.tags.join('\u0001') !== (b.tags || []).join('\u0001');
+      if (changed) toast('没点「保存」，这次的改动没存');
+    }
+    bdraft = null;
+  }
 
   // 打开某本书的编辑框：拿它现在的标签和书评起一份草稿
   function openEditor(bid) {
@@ -2868,10 +3026,17 @@
   // 书籍角标：自定义标签 + 读到哪 + 标了几章 + 有书评。
   // noProg：进度已经在别处单独占一行了（列表页），这儿就别再挂一份
   // bmkBtn：书籍详情页上，🔖n 做成按钮，点开下面列出书签在哪几章
-  function bookBadgeHTML(b, noProg, bmkBtn) {
+  // statusElsewhere：状态小条挂在别处（列表页的简介那一行）
+  function bookBadgeHTML(b, noProg, bmkBtn, statusElsewhere) {
     if (!b || b.deleted) return '';
-    const tags = (b.tags || []).map((t) => pill('#5a6b8c', esc(t))).join('');
     const prog = noProg ? '' : statusPill(b, false);
+    /*
+     * 有进度的书打了「弃坑」，状态小条显示 ✕ 弃坑 —— 那「弃坑」这个标签就别再挂一遍，
+     * 并排两个弃坑看着像 bug。状态小条不在场的地方（比如纯目录页）标签照挂。
+     */
+    const dupDrop = DB.isDropped(b.id) && DB.prog(b.id) && (!noProg || statusElsewhere);
+    const tags = (b.tags || []).filter((t) => !(dupDrop && t === DROP_TAG))
+      .map((t) => pill('#5a6b8c', esc(t))).join('');
     const n = idx().markedCount(b.id);
     const cnt = n ? `<span style="color:#999;margin-left:4px">${n}章</span>` : '';
     const nb = idx().bmksOfBook(b.id).length;
@@ -3178,6 +3343,14 @@
     if (list.innerHTML !== html) list.innerHTML = html;
   }
 
+  /*
+   * 书籍页上那支铅笔：打开「这本书」面板写书评、打标签、看书签。
+   * 原来目录上方有一排「📖 标签 / 书评 / 书签 · 📚 我的标记 · ⚙️」—— 后两个
+   * 顶栏上就有，重复了；第一个缩成这支铅笔，挂在「清除进度」那一行。
+   */
+  const PEN_LINK = '<span data-fw-open="book" title="写书评 / 打标签 / 看书签" ' +
+    'style="margin-left:8px;cursor:pointer;font-size:13px">✏️</span>';
+
   // 站点自己那排书籍标签（原创小说 – BL – 完结 – …）所在的那一行
   function siteTagLine() {
     const as = document.querySelectorAll('.article-body a[href*="/tag/"]');
@@ -3217,7 +3390,8 @@
         (DB.prog(Page.bid) ? link(`data-fw-progdel="${esc(Page.bid)}"`, '清除进度') : '') +
         (b && b.queued
           ? link(`data-fw-queue="${esc(Page.bid)}" data-on="1"`, '📌 已在接下来看')
-          : link(`data-fw-queue="${esc(Page.bid)}"`, '📌 接下来看'));
+          : link(`data-fw-queue="${esc(Page.bid)}"`, '📌 接下来看')) +
+        PEN_LINK;
       if (box.innerHTML !== html) box.innerHTML = html;
       paintBmkList(box);
     } else {
@@ -3226,7 +3400,7 @@
        * 底下那条「上次读到…点这里继续」已经把进度说得很清楚了，
        * 标题上再挂一遍纯属重复，还会把面包屑挤到第二行。标签之类照旧挂。
        */
-      const lite = bookBadgeHTML(b, true);
+      const lite = bookBadgeHTML(b, true) + PEN_LINK;
       crumbs.forEach((el) => attachBadge(el, lite));
     }
 
@@ -3275,7 +3449,7 @@
       // 短角标（标签 / 标了几章 / 书签 / 📝）挂在书名后面；
       // 进度另起一行靠右（attachListRows）。找不到 article 条目时进度也退回书名后
       const inRow = attachListRows(a, b);
-      attachBadge(a, bookBadgeHTML(b, inRow));
+      attachBadge(a, bookBadgeHTML(b, inRow, false, inRow));
     }
   }
 
@@ -3428,33 +3602,7 @@
     if (drop) ul.insertBefore(li, drop); else ul.appendChild(li);
   }
 
-  function injectPageActions() {
-    if (Page.type !== 'catalog' || !Page.bid) return;
-    const panel = pageHost();
-    if (!panel) return;
 
-    let bar = panel.querySelector(':scope > [data-fw-actions]');
-    if (!bar) {
-      bar = document.createElement('div');
-      bar.setAttribute('data-fw-actions', '1');
-      bar.style.cssText = 'margin:0 0 12px;text-align:center;font-size:12px;line-height:2.2';
-      const strip = panel.querySelector(':scope > [data-fw-strip]');
-      if (strip) strip.insertAdjacentElement('afterend', bar);
-      else panel.insertBefore(bar, panel.firstChild);
-    }
-
-    const b = DB.book(Page.bid, false);
-    const nb = idx().bmksOfBook(Page.bid).length;
-    const nc = idx().markedCount(Page.bid);
-    const btn = (v, txt) =>
-      `<span data-fw-open="${v}" style="display:inline-block;margin:0 4px;padding:3px 12px;` +
-      `border-radius:12px;cursor:pointer;background:#8881;color:#666">${txt}</span>`;
-    const html =
-      btn('book', `📖 标签 / 书评 / 书签${nb ? ' 🔖' + nb : ''}`) +
-      btn('all', `📚 我的标记${nc ? ' · 本书 ' + nc + ' 章' : ''}`) +
-      btn('cfg', '⚙️');
-    if (bar.innerHTML !== html) bar.innerHTML = html;
-  }
 
   addEventListener('resize', () => {
     clearTimeout(paintAll._rt);
@@ -3463,7 +3611,7 @@
 
   function paintAll() {
     IDX = null;                       // 这一轮重新建索引，免得读到过期数据
-    injectNavEntry(); injectPageActions();
+    injectNavEntry();
     paintCatalog(); paintProfile(); paintBookList(); paintInline();
   }
   paintAll();
@@ -3636,7 +3784,7 @@
   }
 
   // 本机测试台专用：把内部对象挂出来给断言脚本用（真站的域名不是这俩，不会挂）
-  if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) window.__fw = { DB, Sync };
+  if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) window.__fw = { DB, Sync, Pre };
 
   const anyCloud = Object.values(Backends).some((b) => b.ready());
   if (DB.d.cfg.autoSync && anyCloud && now() - DB.d.lastSync > 5 * 60 * 1000) {

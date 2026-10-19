@@ -38,7 +38,7 @@ python3 test/run-test.py
 
 === 单章固定链接页 ===           === 收藏 / 首页 / 频道 / 索引 ===
   ✅ 只认出 1 章（回帖没被算进来） ✅ 书名后挂上了标签
-220/220 通过
+241/241 通过
 ```
 
 覆盖的页面：首页、收藏、文库、书籍介绍、纯目录列表、正文、单章固定链接、
@@ -64,7 +64,7 @@ python3 test/run-test.py
 `?fwtest=<mode>` 是给断言脚本切场景用的：`strip` / `landing` / `scroll` / `legacy` /
 `dupbmk` / `progcleared` / `ratecleared` / `upd` / `crosstab` / `cidsowned` / `tagclick` /
 `lastchap` / `postrec` / `cloudprog` / `dark` / `discard`（编辑框不点「写好了」就关 + 点背景关面板）/
-`queuetoggle` / `dequeue` / `bmklist` / `drag` / `listprog`（列表页上每本书都带进度，截图看位置用）/
+`queuetoggle` / `dequeue` / `bmklist` / `drag` / `dropdup` / `bookdraft` / `prefetch` / `listprog`（列表页上每本书都带进度，截图看位置用）/
 `openpanel`（面板开着不关，截图用）。截图时 `dark` 再带 `&keep&panel` 就是黑着并开着面板。
 
 断言脚本要碰内部对象时用 `window.__fw`（`{ DB, Sync }`）。这个挂钩**只在
@@ -313,6 +313,20 @@ const steps = [['mig1','_mig1'], ['mig2','_mig2'], ['mig3','_mig3'],
 
 > 回归测试：`?fwtest=crosstab`（直接改存储假装另一个标签页写过，再触发本页写入），
 > 外加一条静态检查盯住 `_flush()` 里必须有 `mergeStored`。
+
+### 预载下一章怎么「换」
+
+单章页读过一半（`maybePrefetch`）就 `fetch` 下一章的整页，`DOMParser` 解析好放内存（`Pre`）。
+点「下一章」时（捕获阶段拦截，只拦 `href === Pre.url` 的那个链接）：
+把当前页里包着 `#post{pid}` 的那个 `.container-fluid`（面包屑 + 正文 + 回帖 + 回帖框）
+整块换成新页面里对应的那块，`history.pushState` 换地址，然后 `Page.detect()` + `paintAll()`。
+
+- 换进来的 `<script>` 不会执行 —— 站点那些按钮靠的是 `onclick` 属性和挂在 document 上的
+  委托，照样能用；只有广告的 push 脚本不跑（正好）
+- 换过之后按「返回」：地址变了内容没变，`popstate` 里直接 reload。
+  只认**路径**变了 —— 点「回复」跳 `#replyToThread` 也会触发 popstate，不能误伤
+- 校验不过（WAF 验证页、新页面里找不到 `#post{pid}` 带章节导航）一律退回整页跳转
+- 测试台的单章页夹具只有一章，所以服务端按请求的 id 把夹具里的章 id 换掉（`?fwtest=prefetch`）
 
 ### 书单的分组只有一份
 
