@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.18.0
+// @version      1.18.1
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1556,17 +1556,15 @@
 
   /*
    * ---- 预载下一章 ----
-   * 单章页读过一半，就悄悄把下一章的页面抓下来；点「下一章」时不走整页跳转，
-   * 直接把正文那一块换成新的（地址栏也跟着换），所以不用等加载。
+   * 打开单章页没多久就悄悄把下一章的页面抓下来；点「下一章」时不走整页跳转，
+   * 直接把这一页换成下一章（地址栏、标题、正文、回帖都换），所以不用等加载。
+   * 换过去之后马上接着抓再下一章，连着读一路都是秒开。
    *
-   * 缓存什么时候扔：
-   *   · 只存在内存里、只存下一章一份 —— 不占手机存储，也不同步
-   *   · 换过去了 / 离开这一页 / 关掉标签页，自然就没了
-   *   · 抓下来超过 10 分钟还没点，就当过期（作者可能改了字），点的时候重新正常加载
+   * 缓存什么时候扔：只存在内存里、只存下一章一份 —— 换过去了、离开这一页、
+   * 关掉标签页就没了。切到别的 App 再回来还在。
    * 抓到的不对劲（撞上 WAF 验证页、页面结构对不上）一律不用，退回正常跳转。
    */
-  const Pre = { url: null, doc: null, at: 0, job: null };
-  const PRE_TTL = 10 * 60 * 1000;
+  const Pre = { url: null, doc: null, job: null };
   let shownPath = location.pathname;
 
   // 本章自带的「下一章」按钮（最后一章没有 —— 那儿写的是「最后一章」）
@@ -1593,23 +1591,20 @@
         if (!doc || !doc.querySelector('#post' + pid + ' ' + FW.SEL.chapNav)) {
           Pre.url = null; return null;
         }
-        Pre.doc = doc; Pre.at = now();
+        Pre.doc = doc;
         return doc;
       })
       .catch(() => { Pre.url = null; return null; });
   }
 
-  // 读到这一章的一半就开始预载
+  // 不等读到一半：随时可能直接点「下一章」，早抓早好
   function maybePrefetch() {
-    const ch = Page.chapters[0];
-    if (!Page.single || !ch || Pre.url) return;
-    const r = ch.el.getBoundingClientRect();
-    if (r.height > 0 && (innerHeight - r.top) / r.height > 0.5) prefetchNext();
+    if (Page.single && !Pre.url) prefetchNext();
   }
 
   // 点「下一章」：有预载好的就原地换，没有（或还没抓完、等不及）就正常跳
   async function goNext(url) {
-    let doc = Pre.url === url && now() - Pre.at < PRE_TTL ? Pre.doc : null;
+    let doc = Pre.url === url ? Pre.doc : null;
     if (!doc && Pre.url === url && Pre.job) {
       doc = await Promise.race([Pre.job, new Promise((r) => setTimeout(() => r(null), 2500))]);
     }
@@ -1630,6 +1625,7 @@
     Page.detect();
     paintAll();
     setTimeout(() => { syncFocus(); Progress.record(); }, 800);
+    setTimeout(maybePrefetch, 1500);         // 接着抓再下一章
   }
 
   // 换过章之后按「返回」：地址栏回去了，页面内容还是新的 —— 重新加载那一页
@@ -1649,7 +1645,8 @@
       t = setTimeout(() => Progress.record(), 450);
     }, { passive: true });
     // 进正文页先记一次，至少知道读到哪章了
-    setTimeout(() => { syncFocus(); Progress.record(); maybePrefetch(); }, 800);
+    setTimeout(() => { syncFocus(); Progress.record(); }, 800);
+    setTimeout(maybePrefetch, 1500);         // 等首屏画完再抓，别跟它抢网
 
     // 点「下一章」：预载过的就原地换
     document.addEventListener('click', (e) => {
@@ -2447,8 +2444,8 @@
           <span class="sw ${c.prefetch !== false ? 'on' : ''}" data-prefetch role="switch"
             aria-checked="${c.prefetch !== false}"></span>
         </label>
-        <div class="hint">单章页读过一半，就先把下一章抓下来，点「下一章」不用等加载。
-          只存在内存里、只存一章，换过去或离开页面就扔了。</div>
+        <div class="hint">打开单章页就先把下一章抓下来，点「下一章」不用等加载。
+          只存在内存里、只存一章，换过去或离开页面就扔了。每章会多下载一页。</div>
       </div>
 
       <div class="hint" style="margin:0 0 16px;background:#8881;padding:10px;border-radius:9px">

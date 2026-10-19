@@ -706,8 +706,10 @@ CHECK_JS = r"""
           r.swTop = Math.round(window.scrollY);
           setTimeout(function () {
             r.swProg = ((window.__fw.DB.d.prog || {})['__TID__'] || {}).cid || '';
+            // 换过去之后接着预载再下一章（夹具里第 2 章的下一章还是它自己，这里只看有没有动）
+            r.swChained = !!window.__fw.Pre.url;
             finish();
-          }, 1200);
+          }, 2500);
         }, 600);
       }, 2000);
       return;
@@ -1581,7 +1583,7 @@ def main():
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         (f'/posts/{PID_PROGRESS}?fwtest=prefetch', '预载下一章 → 点了原地换过去', [
-            ('读过一半就开始预载',     lambda r: r.get('preUrl', '').endswith('/posts/' + PIDS[1])),
+            ('打开就开始预载',         lambda r: r.get('preUrl', '').endswith('/posts/' + PIDS[1])),
             ('抓下来了',               lambda r: r.get('preReady') is True),
             ('点「下一章」地址换了',   lambda r: r.get('swPath') == '/posts/' + PIDS[1]),
             ('没有整页重新加载',       lambda r: r.get('swNoReload') is True),
@@ -1590,6 +1592,7 @@ def main():
             ('新的一章也挂上了标记条', lambda r: r.get('swBars') == 1),
             ('滚回了顶上',             lambda r: r.get('swTop') == 0),
             ('进度记到了新的一章',     lambda r: r.get('swProg') == PIDS[1]),
+            ('换过去后接着预载',       lambda r: r.get('swChained') is True),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         # 详情页夹具的顶栏里没有「我要签到」，单章页的有
