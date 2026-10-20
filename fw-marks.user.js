@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         废文网 · 书签标记 & 云同步
 // @namespace    didi.fw
-// @version      1.19.0
+// @version      1.20.0
 // @description  章节标签(精彩/一般/跳过)、书签(多个/手动/免命名)、整本书书评与自定义标签、阅读进度、目录/书列表/正文页内联角标、GitHub 私有仓库 + 坚果云 WebDAV 双备份同步
 // @author       小喵
 // @match        *://*.xn--pxtr7m5ny.com/*
@@ -1565,17 +1565,19 @@
    * 抓到的不对劲（撞上 WAF 验证页、页面结构对不上）一律不用，退回正常跳转。
    */
   /*
-   * 两份内存缓存，都是「整块页面内容」（包着正文、回帖的那个 .container-fluid）：
-   *   Pre  下一章（预载抓下来的）
-   *   Prev 上一章（换走时把原来那块留着）
-   * 点「下一章 / 上一章」命中缓存就原地换，不用等加载。
+   * 内存里的章节缓存，都是「整块页面内容」（包着正文、回帖的那个 .container-fluid）：
+   *   Pre   下一章（预载抓下来的）
+   *   Seen  这一页里看过、换走的那些章（按路径存，最多 SEEN_MAX 章）
    *
-   * 换章用 replaceState 而不是 pushState：**不往浏览器历史里加记录**。
-   * 所以从目录点进来连翻 5 章，按一次返回就回目录 —— 不用按 5 次，
-   * 也不会每按一次重新加载一章。
+   * 换章照常往浏览器历史里加一条（pushState），所以返回是一章一章往回退，
+   * 退到进来的第一章再按一次，就回到目录（目录本来就在返回链里）。
+   * 按返回 / 前进时，那一章如果还在 Seen 里就原地换回来、回到当时读到的位置，
+   * 不重新加载；早就被挤出去的才老老实实 reload。
+   * 离开这一页 / 关掉标签页，缓存就全没了。
    */
   const Pre = { url: null, wrap: null, title: '', job: null };
-  const Prev = { url: null, wrap: null, title: '' };
+  const Seen = new Map();          // 路径 → { wrap, title, y }
+  const SEEN_MAX = 12;
   let shownPath = location.pathname;
   const pathOf = (u) => { try { return new URL(u, location.href).pathname; } catch (e) { return ''; } };
   const curWrap = () => Page.chapters[0] && Page.chapters[0].el.closest('.container-fluid');
@@ -1592,6 +1594,8 @@
     if (DB.d.cfg.prefetch === false) return;
     const url = nextLink();
     if (!url || pathOf(Pre.url) === pathOf(url)) return;
+    // 下一章本来就在缓存里（往回退过又往前读），不用再抓
+    if (Seen.has(pathOf(url))) { Pre.url = url; Pre.wrap = null; Pre.job = null; return; }
     const pid = (url.match(/\/posts\/(\d+)/) || [])[1];
     Pre.url = url; Pre.wrap = null;
     Pre.job = fetch(url, { credentials: 'same-origin' })
@@ -1616,48 +1620,59 @@
     if (Page.single && !Pre.url) prefetchNext();
   }
 
-  // 把当前这块换成 wrap，地址栏换成 url（不新增历史记录）
-  function swapTo(wrap, title, url) {
+  /*
+   * 把当前这块换成 wrap。换走的那块连同读到的位置收进 Seen。
+   * push=true：点链接过去的，往历史里加一条；false：返回 / 前进过来的，历史已经动过了。
+   */
+  function swapTo(wrap, title, url, push, y) {
     Progress.record();                       // 这一章读到的位置先落下
     DB.saveNow();
     const cur = curWrap();
-    const out = { url: location.href, wrap: cur, title: document.title };
+    Seen.delete(shownPath);
+    Seen.set(shownPath, { wrap: cur, title: document.title, y: window.scrollY });
+    while (Seen.size > SEEN_MAX) Seen.delete(Seen.keys().next().value);   // 挤掉最早的
+    Seen.delete(pathOf(url));                // 要显示的这一章不再算「缓存」
     cur.replaceWith(wrap);
     document.title = title;
-    history.replaceState(history.state, '', url);
+    if (push) history.pushState({ fw: 1 }, '', url);
     shownPath = location.pathname;
-    window.scrollTo(0, 0);
+    window.scrollTo(0, y || 0);
     Page.detect();
     paintAll();
     setTimeout(() => { syncFocus(); Progress.record(); }, 800);
-    return out;
+    if (pathOf(Pre.url) !== pathOf(nextLink() || '')) {
+      Object.assign(Pre, { url: null, wrap: null, title: '', job: null });
+    }
+    setTimeout(maybePrefetch, 1500);         // 接着备好下一章
   }
 
-  // 点「下一章」：有预载好的就原地换，没有（或还没抓完、等不及）就正常跳
+  // 点「下一章」：预载好的（或缓存里有的）就原地换，没有（或等不及）就正常跳
   async function goNext(url) {
-    let wrap = Pre.wrap;
+    const hit = Seen.get(pathOf(url));
+    let wrap = hit ? hit.wrap : Pre.wrap;
+    const title = hit ? hit.title : Pre.title;
     if (!wrap && Pre.job) {
       wrap = await Promise.race([Pre.job, new Promise((r) => setTimeout(() => r(null), 2500))]);
     }
     if (!wrap || !curWrap()) { location.href = url; return; }
-    const out = swapTo(wrap, Pre.title, url);
-    Object.assign(Prev, out);                // 换走的这一章留着，点「上一章」秒回
     Object.assign(Pre, { url: null, wrap: null, title: '', job: null });
-    setTimeout(maybePrefetch, 1500);         // 接着抓再下一章
+    swapTo(wrap, title || Pre.title, url, true, 0);
   }
 
-  // 点「上一章」：刚换走的那一章还在内存里，原地换回来
-  function goPrev(url) {
-    if (!Prev.wrap || !curWrap()) { location.href = url; return; }
-    const out = swapTo(Prev.wrap, Prev.title, url);
-    // 换回来之后，刚才那一章正好就是「下一章」，直接当预载用
-    Object.assign(Pre, out, { job: null });
-    Object.assign(Prev, { url: null, wrap: null, title: '' });
+  // 点页面上的链接去一个缓存里有的章（比如「上一章」）：原地换，照常加一条历史
+  function goSeen(url) {
+    const hit = Seen.get(pathOf(url));
+    if (!hit || !curWrap()) { location.href = url; return; }
+    swapTo(hit.wrap, hit.title, url, true, 0);
   }
 
-  // 不新增历史之后，这里只剩「点回复跳 #锚点」这种同页的 popstate；路径真变了才重载
+  // 返回 / 前进：那一章还在缓存里就换回来并回到当时的位置，不在就重新加载
   addEventListener('popstate', () => {
-    if (location.pathname !== shownPath) location.reload();
+    const path = location.pathname;
+    if (path === shownPath) return;          // 点「回复」跳 #锚点这种，同一页，不管
+    const hit = Seen.get(path);
+    if (hit && curWrap()) swapTo(hit.wrap, hit.title, location.href, false, hit.y);
+    else location.reload();
   });
 
   if (Page.type === 'chapter') {
@@ -1674,16 +1689,16 @@
     setTimeout(() => { syncFocus(); Progress.record(); }, 800);
     setTimeout(maybePrefetch, 1500);         // 等首屏画完再抓，别跟它抢网
 
-    // 点「下一章 / 上一章」：内存里有就原地换
+    // 点「下一章」或去一个看过的章（「上一章」）：内存里有就原地换
     document.addEventListener('click', (e) => {
       const a = e.target instanceof Element ? e.target.closest('a[href]') : null;
       if (!a || e.button || e.metaKey || e.ctrlKey || e.shiftKey) return;   // 新标签页打开的不管
       const p = pathOf(a.href);
       const isNext = Pre.url && p === pathOf(Pre.url);
-      const isPrev = Prev.wrap && p === pathOf(Prev.url);
-      if (!isNext && !isPrev) return;
+      const isSeen = Seen.has(p);
+      if (!isNext && !isSeen) return;
       e.preventDefault(); e.stopPropagation();
-      if (isNext) goNext(a.href); else goPrev(a.href);
+      if (isNext) goNext(a.href); else goSeen(a.href);
     }, true);
 
     // 刚从书签/继续读跳过来 → 直接复位，不再问「回去吗」
@@ -3810,7 +3825,7 @@
   }
 
   // 本机测试台专用：把内部对象挂出来给断言脚本用（真站的域名不是这俩，不会挂）
-  if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) window.__fw = { DB, Sync, Pre, Prev };
+  if (/^(127\.0\.0\.1|localhost)$/.test(location.hostname)) window.__fw = { DB, Sync, Pre, Seen };
 
   const anyCloud = Object.values(Backends).some((b) => b.ready());
   if (DB.d.cfg.autoSync && anyCloud && now() - DB.d.lastSync > 5 * 60 * 1000) {

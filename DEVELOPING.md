@@ -320,17 +320,14 @@ const steps = [['mig1','_mig1'], ['mig2','_mig2'], ['mig3','_mig3'],
 单章页读过一半（`maybePrefetch`）就 `fetch` 下一章的整页，`DOMParser` 解析好放内存（`Pre`）。
 点「下一章」时（捕获阶段拦截，只拦 `href === Pre.url` 的那个链接）：
 把当前页里包着 `#post{pid}` 的那个 `.container-fluid`（面包屑 + 正文 + 回帖 + 回帖框）
-整块换成新页面里对应的那块，`history.replaceState` 换地址，然后 `Page.detect()` + `paintAll()`。
-换走的那块留在 `Prev`，点「上一章」原地换回来，换回来时刚才那块又成了 `Pre`。
+整块换成新页面里对应的那块，`history.pushState` 加一条历史，然后 `Page.detect()` + `paintAll()`。
+换走的那块连同 `scrollY` 收进 `Seen`（按路径存，最多 12 章，挤掉最早的）。
 
-**用 `replaceState` 不用 `pushState` 是故意的**：不新增历史，从目录进来连翻 5 章，
-一次返回就回目录。用 `pushState` 的话得按 5 次返回，而且每次都要 reload 一章
-（地址回去了、内容没回去）。
+返回 / 前进触发 `popstate`：目标路径在 `Seen` 里就原地换回来、滚回当时的位置；
+不在（被挤掉了）才 reload。退到这一页最初那一章再按返回，是跨文档的历史，
+浏览器自己回目录 —— 目录始终在返回链里。点「回复」跳 `#replyToThread` 这种
+同页锚点也会触发 popstate，路径没变就不管。
 
-- 换进来的 `<script>` 不会执行 —— 站点那些按钮靠的是 `onclick` 属性和挂在 document 上的
-  委托，照样能用；只有广告的 push 脚本不跑（正好）
-- `popstate` 里路径真变了才 reload（兜底）；点「回复」跳 `#replyToThread` 这种同页锚点
-  也会触发 popstate，不能误伤
 - 校验不过（WAF 验证页、新页面里找不到 `#post{pid}` 带章节导航）一律退回整页跳转
 - 测试台的单章页夹具只有一章，所以服务端按请求的 id 把夹具里的章 id 换掉（`?fwtest=prefetch`）
 

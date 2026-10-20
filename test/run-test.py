@@ -691,7 +691,7 @@ CHECK_JS = r"""
     if (location.search.indexOf('fwtest=prefetch') >= 0) {
       window.__notReloaded = 1;
       var post8 = document.querySelector('[id^="post"]');
-      window.scrollTo(0, document.documentElement.scrollHeight);
+      window.scrollTo(0, 600);   // 读到一半的位置，返回时要回到这儿
       setTimeout(function () {
         var P = window.__fw && window.__fw.Pre;
         r.preUrl = P ? (P.url || '') : '';
@@ -708,28 +708,29 @@ CHECK_JS = r"""
           r.swOldGone = !document.getElementById('post__PID_PROGRESS__');
           r.swBars = n('[data-fw-bar]');
           r.swTop = Math.round(window.scrollY);
-          // 换章不往浏览器历史里加记录：连翻几章，按一次返回就回到进来之前那页
+          // 换章照常加一条历史：返回是一章一章往回退，目录还在返回链里
           r.histAfter = history.length;
-          r.prevCached = !!window.__fw.Prev.wrap;
+          r.prevCached = window.__fw.Seen.has('/posts/__PID_PROGRESS__');
           setTimeout(function () {
             r.swProg = ((window.__fw.DB.d.prog || {})['__TID__'] || {}).cid || '';
             // 换过去之后接着预载再下一章（夹具里第 2 章的下一章还是它自己，这里只看有没有动）
             r.swChained = !!window.__fw.Pre.url;
-            // 点「上一章」：刚换走的那章还在内存里，原地换回来。
-            // 夹具是第一章改了 id，没有「上一章」按钮，所以塞一个进去点
-            var pv = document.createElement('a');
-            pv.href = '/posts/__PID_PROGRESS__'; pv.textContent = '上一章';
-            document.body.appendChild(pv);
-            pv.click();
+            // 按返回：回到第一章，从内存里换回来，不重新加载
+            history.back();
             setTimeout(function () {
               r.backPath = location.pathname;
               r.backNoReload = window.__notReloaded === 1;
               r.backBlock = !!document.getElementById('post__PID_PROGRESS__');
-              r.backHist = history.length;
-              // 换回来之后，刚才那章直接当「下一章」的预载
-              r.backNextReady = (window.__fw.Pre.url || '').indexOf('/posts/__PID_NEXT__') >= 0
-                && !!window.__fw.Pre.wrap;
-              finish();
+              r.backY = Math.round(window.scrollY);
+              // 刚才那章被收进缓存了，再按前进也能原地换过去
+              r.fwdCached = window.__fw.Seen.has('/posts/__PID_NEXT__');
+              history.forward();
+              setTimeout(function () {
+                r.fwdPath = location.pathname;
+                r.fwdNoReload = window.__notReloaded === 1;
+                r.fwdBlock = !!document.getElementById('post__PID_NEXT__');
+                finish();
+              }, 600);
             }, 600);
           }, 2500);
         }, 600);
@@ -1619,13 +1620,15 @@ def main():
             ('滚回了顶上',             lambda r: r.get('swTop') == 0),
             ('进度记到了新的一章',     lambda r: r.get('swProg') == PIDS[1]),
             ('换过去后接着预载',       lambda r: r.get('swChained') is True),
-            ('换章不新增历史记录（一次返回就回目录）',
-             lambda r: r.get('histAfter') == r.get('histBefore')),
-            ('上一章留在内存里',       lambda r: r.get('prevCached') is True),
-            ('点「上一章」原地换回来', lambda r: r.get('backPath') == '/posts/' + PID_PROGRESS
+            ('换章加一条历史（返回逐章往回退）',
+             lambda r: r.get('histAfter') == (r.get('histBefore') or 0) + 1),
+            ('换走的那章留在内存里',   lambda r: r.get('prevCached') is True),
+            ('按返回：回到上一章，原地换回不重新加载',
+             lambda r: r.get('backPath') == '/posts/' + PID_PROGRESS
              and r.get('backBlock') is True and r.get('backNoReload') is True),
-            ('换回来也不新增历史',     lambda r: r.get('backHist') == r.get('histBefore')),
-            ('换回来后刚才那章直接当预载', lambda r: r.get('backNextReady') is True),
+            ('返回后回到当时读到的位置', lambda r: (r.get('backY') or 0) > 100),
+            ('再按前进也原地换过去',   lambda r: r.get('fwdPath') == '/posts/' + PIDS[1]
+             and r.get('fwdBlock') is True and r.get('fwdNoReload') is True),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         # 详情页夹具的顶栏里没有「我要签到」，单章页的有
