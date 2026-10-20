@@ -457,11 +457,12 @@ CHECK_JS = r"""
      *
      * 麻烦在于点了就会跳转，文档一被换走，dump-dom 就什么都取不到。
      * 办法：临时钩住 Storage.setItem 截下脚本存的「定位接力棒」，
-     * 然后马上 window.stop() 把这次跳转掐掉，原地交结果。
+     * 再用 Navigation API 把这次跳转 preventDefault 掉，原地交结果。
      *
-     * 以前是再赋一次 location.href 跳去取结果页、指望后一次跳转盖掉前一次 ——
-     * 那是在赌时序：页面一加载上真样式表，两次跳转都发出去了，Chrome 卡在中间
-     * 一个字都不吐（实测，查了好一阵）。掐掉跳转就没有这个赛跑了。
+     * 踩过的两个坑：
+     *   · 再赋一次 location.href 去盖掉前一次跳转 —— 赌时序，必然时好时坏
+     *   · window.stop() 掐跳转 —— 页面上还有没加载完的东西时，headless Chrome
+     *     会直接卡住，dump 一个字都不吐（换了网络环境之后必现）
      */
     if (location.search.indexOf('fwtest=strip') >= 0) {
       var s = document.querySelector('[data-fw-strip]');
@@ -471,8 +472,10 @@ CHECK_JS = r"""
           if (k === '__fw_jump__') cap = v;
           return origSet.apply(this, arguments);
         };
+        // 拦掉脚本发起的那次跳转（Navigation API：同源跳转可以 preventDefault）
+        var block = function (ev) { if (ev.cancelable) ev.preventDefault(); };
+        if (window.navigation) navigation.addEventListener('navigate', block);
         s.click();
-        window.stop();
         Storage.prototype.setItem = origSet;
         r.jumpPending = cap || '';
         return finish();
@@ -692,7 +695,8 @@ CHECK_JS = r"""
       setTimeout(function () {
         var P = window.__fw && window.__fw.Pre;
         r.preUrl = P ? (P.url || '') : '';
-        r.preReady = !!(P && P.doc);
+        r.preReady = !!(P && P.wrap);
+        r.histBefore = history.length;
         var nx = [].filter.call(document.querySelectorAll('a[href*="/posts/"]'),
           function (a) { return a.textContent.trim() === '下一章'; }).pop();
         r.nextHref = nx ? nx.getAttribute('href') : '';
@@ -704,11 +708,29 @@ CHECK_JS = r"""
           r.swOldGone = !document.getElementById('post__PID_PROGRESS__');
           r.swBars = n('[data-fw-bar]');
           r.swTop = Math.round(window.scrollY);
+          // 换章不往浏览器历史里加记录：连翻几章，按一次返回就回到进来之前那页
+          r.histAfter = history.length;
+          r.prevCached = !!window.__fw.Prev.wrap;
           setTimeout(function () {
             r.swProg = ((window.__fw.DB.d.prog || {})['__TID__'] || {}).cid || '';
             // 换过去之后接着预载再下一章（夹具里第 2 章的下一章还是它自己，这里只看有没有动）
             r.swChained = !!window.__fw.Pre.url;
-            finish();
+            // 点「上一章」：刚换走的那章还在内存里，原地换回来。
+            // 夹具是第一章改了 id，没有「上一章」按钮，所以塞一个进去点
+            var pv = document.createElement('a');
+            pv.href = '/posts/__PID_PROGRESS__'; pv.textContent = '上一章';
+            document.body.appendChild(pv);
+            pv.click();
+            setTimeout(function () {
+              r.backPath = location.pathname;
+              r.backNoReload = window.__notReloaded === 1;
+              r.backBlock = !!document.getElementById('post__PID_PROGRESS__');
+              r.backHist = history.length;
+              // 换回来之后，刚才那章直接当「下一章」的预载
+              r.backNextReady = (window.__fw.Pre.url || '').indexOf('/posts/__PID_NEXT__') >= 0
+                && !!window.__fw.Pre.wrap;
+              finish();
+            }, 600);
           }, 2500);
         }, 600);
       }, 2000);
@@ -1009,6 +1031,10 @@ def inject_html(html, query=''):
     inject = ''.join(parts)
     # 夹具里的绝对域名要改回本地，否则点链接会跑到真站上去
     html = re.sub(r'https?://www\.xn--pxtr7m5ny\.com', '', html)
+    # 外站脚本（站点自己的 all.js、Google 广告 / 统计）一律去掉：测试台不该依赖网络。
+    # 实测网络一慢，这些请求挂着不结束，「点上次读到」那个用例里的 window.stop()
+    # 就会让 Chrome 卡住一个字都不吐 —— 在本地断网也能跑才是测试台该有的样子
+    html = re.sub(r'<script[^>]*\ssrc="https?://[^"]*"[^>]*>\s*</script>', '', html)
     # 站点样式表指到本地那份（test/assets/app.css，没有就是朴素排版，功能照跑）
     html = re.sub(r'https://[a-z0-9]+\.cloudfront\.net/css/(app\.css)\?[^"]*', r'/__assets__/\1', html)
     return html.replace('</body>', inject + '</body>') if '</body>' in html else html + inject
@@ -1593,6 +1619,13 @@ def main():
             ('滚回了顶上',             lambda r: r.get('swTop') == 0),
             ('进度记到了新的一章',     lambda r: r.get('swProg') == PIDS[1]),
             ('换过去后接着预载',       lambda r: r.get('swChained') is True),
+            ('换章不新增历史记录（一次返回就回目录）',
+             lambda r: r.get('histAfter') == r.get('histBefore')),
+            ('上一章留在内存里',       lambda r: r.get('prevCached') is True),
+            ('点「上一章」原地换回来', lambda r: r.get('backPath') == '/posts/' + PID_PROGRESS
+             and r.get('backBlock') is True and r.get('backNoReload') is True),
+            ('换回来也不新增历史',     lambda r: r.get('backHist') == r.get('histBefore')),
+            ('换回来后刚才那章直接当预载', lambda r: r.get('backNextReady') is True),
             ('没有 JS 报错',          lambda r: not r['jsErrors']),
         ]),
         # 详情页夹具的顶栏里没有「我要签到」，单章页的有

@@ -38,7 +38,7 @@ python3 test/run-test.py
 
 === 单章固定链接页 ===           === 收藏 / 首页 / 频道 / 索引 ===
   ✅ 只认出 1 章（回帖没被算进来） ✅ 书名后挂上了标签
-241/241 通过
+247/247 通过
 ```
 
 覆盖的页面：首页、收藏、文库、书籍介绍、纯目录列表、正文、单章固定链接、
@@ -74,10 +74,11 @@ python3 test/run-test.py
 可点的地址都列在 <http://127.0.0.1:8899/__routes__>。
 碰到没抓夹具的页面会给张说明页（不是 404），照着往 `PATTERNS` 加一行就行。
 
-> 断言脚本里**别靠「再跳一次页面」取结果**。`点「上次读到」` 那个用例以前就是
-> 再赋一次 `location.href` 跳去取结果页、指望后一次跳转盖掉前一次 —— 那是在赌时序，
-> 一直「偶尔假红」，加载上真样式表后变成必红：两次跳转都发出去，Chrome 卡在中间
-> 一个字都不吐。现在点完立刻 `window.stop()` 掐掉跳转、原地交结果。
+> 断言脚本里要拦跳转，用 **Navigation API**（`navigation.addEventListener('navigate',
+> e => e.preventDefault())`）。踩过两个坑：再赋一次 `location.href` 盖掉前一次跳转是赌时序，
+> 时好时坏；`window.stop()` 掐跳转则在页面还有资源没加载完时让 headless Chrome 卡死、
+> 一个字都不吐（换了网络环境后必现）。
+> 另外夹具里的外站脚本（站点 all.js、Google 广告 / 统计）一律被去掉 —— 测试台不依赖网络。
 > （页面实在没跑出结果时测试台会自动重跑一次，两次都空才算真挂。）
 
 想用眼睛看排版：`python3 test/run-test.py --shot "<路径>" out.png [宽度]`，
@@ -319,12 +320,17 @@ const steps = [['mig1','_mig1'], ['mig2','_mig2'], ['mig3','_mig3'],
 单章页读过一半（`maybePrefetch`）就 `fetch` 下一章的整页，`DOMParser` 解析好放内存（`Pre`）。
 点「下一章」时（捕获阶段拦截，只拦 `href === Pre.url` 的那个链接）：
 把当前页里包着 `#post{pid}` 的那个 `.container-fluid`（面包屑 + 正文 + 回帖 + 回帖框）
-整块换成新页面里对应的那块，`history.pushState` 换地址，然后 `Page.detect()` + `paintAll()`。
+整块换成新页面里对应的那块，`history.replaceState` 换地址，然后 `Page.detect()` + `paintAll()`。
+换走的那块留在 `Prev`，点「上一章」原地换回来，换回来时刚才那块又成了 `Pre`。
+
+**用 `replaceState` 不用 `pushState` 是故意的**：不新增历史，从目录进来连翻 5 章，
+一次返回就回目录。用 `pushState` 的话得按 5 次返回，而且每次都要 reload 一章
+（地址回去了、内容没回去）。
 
 - 换进来的 `<script>` 不会执行 —— 站点那些按钮靠的是 `onclick` 属性和挂在 document 上的
   委托，照样能用；只有广告的 push 脚本不跑（正好）
-- 换过之后按「返回」：地址变了内容没变，`popstate` 里直接 reload。
-  只认**路径**变了 —— 点「回复」跳 `#replyToThread` 也会触发 popstate，不能误伤
+- `popstate` 里路径真变了才 reload（兜底）；点「回复」跳 `#replyToThread` 这种同页锚点
+  也会触发 popstate，不能误伤
 - 校验不过（WAF 验证页、新页面里找不到 `#post{pid}` 带章节导航）一律退回整页跳转
 - 测试台的单章页夹具只有一章，所以服务端按请求的 id 把夹具里的章 id 换掉（`?fwtest=prefetch`）
 
